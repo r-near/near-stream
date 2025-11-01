@@ -1,4 +1,4 @@
-//! NEAR SSE - Server-Sent Events stream for NEAR blockchain blocks
+//! NEAR Stream - Server-Sent Events stream for NEAR blockchain blocks
 //!
 //! A lightweight service that ingests NEAR blocks from neardata.xyz and streams
 //! them to clients via SSE with automatic catch-up support.
@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "near_sse=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "near_stream=info,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         neardata_base = %config.neardata_base,
         ring_size = config.ring_size,
         poll_retry_ms = config.poll_retry_ms,
-        "Starting NEAR SSE server"
+        "Starting NEAR Stream server"
     );
 
     // Create shared stream state
@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router
     let app = Router::new()
-        .route("/stream", get(stream_handler))
+        .route("/blocks", get(stream_handler))
         .route("/healthz", get(health_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(stream_state);

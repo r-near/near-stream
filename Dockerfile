@@ -21,7 +21,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/near-sse /usr/local/bin/near-sse
+COPY --from=builder /app/target/release/near-stream /usr/local/bin/near-stream
 
 # Expose port
 EXPOSE 8080
@@ -32,4 +32,4 @@ ENV BIND_ADDR=0.0.0.0
 ENV BIND_PORT=8080
 
 # Run the binary
-CMD ["near-sse"]
+CMD ["near-stream"]

@@ -746,7 +746,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "near-sse"
+name = "near-stream"
 version = "0.1.0"
 dependencies = [
  "anyhow",

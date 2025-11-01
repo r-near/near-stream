@@ -1,38 +1,49 @@
-# NEAR SSE
+# NEAR Stream
 
-A lightweight, production-ready Server-Sent Events (SSE) stream for NEAR blockchain blocks. This service ingests finalized blocks from [neardata.xyz](https://neardata.xyz) and streams them to clients in real-time with automatic catch-up support.
+Real-time Server-Sent Events (SSE) stream for NEAR blockchain blocks.
 
-## Features
+## Hosted Service
 
-- **Real-time streaming** - SSE endpoint for live NEAR block data
-- **Automatic catch-up** - Clients can resume from any block height
-- **Finality guarantee** - Only streams finalized blocks
-- **Batch processing** - Efficiently handles multiple new blocks per poll
-- **Ring buffer** - In-memory cache of recent blocks for fast catch-up
-- **Exponential backoff** - Automatic retries with backoff on rate limits and errors
-- **Minimal resource usage** - Designed for self-hosting on modest hardware
+Use the free hosted service at **[stream.near.tools](https://stream.near.tools)**
 
-## Quick Start
+### Quick Start
+
+**Stream from latest block:**
 
 ```bash
-# Build
-cargo build --release
-
-# Run with defaults
-RUST_LOG=info cargo run --release
-
-# Run with custom config
-NEARDATA_BASE=https://mainnet.neardata.xyz \
-RING_SIZE=512 \
-POLL_RETRY_MS=1000 \
-cargo run --release
+curl -N https://stream.near.tools/blocks
 ```
 
-Server starts on `http://0.0.0.0:8080`
+**JavaScript/TypeScript:**
 
-## API Endpoints
+```javascript
+const eventSource = new EventSource("https://stream.near.tools/blocks")
 
-### `GET /stream`
+eventSource.addEventListener("block", (event) => {
+  const block = JSON.parse(event.data)
+  console.log("Block", event.lastEventId, block)
+})
+
+eventSource.addEventListener("ping", (event) => {
+  console.log("Keep-alive ping")
+})
+
+// Automatic reconnection with resume support
+eventSource.onerror = () => {
+  console.log("Connection lost, reconnecting...")
+  // Browser automatically sends Last-Event-ID header to resume
+}
+```
+
+**Resume from specific block:**
+
+```bash
+curl -N "https://stream.near.tools/blocks?from_height=170727400"
+```
+
+### API Endpoints
+
+#### `GET /blocks`
 
 Server-Sent Events endpoint for real-time block streaming.
 
@@ -57,48 +68,54 @@ id: 170727401
 data: {"block_height":170727401,...}
 ```
 
-**Examples:**
+#### `GET /healthz`
+
+Health check endpoint. Returns `"ok"` as JSON.
+
+## Features
+
+- **Real-time streaming** - SSE endpoint for live NEAR block data
+- **Automatic catch-up** - Clients can resume from any block height
+- **Finality guarantee** - Only streams finalized blocks
+- **Batch processing** - Efficiently handles multiple new blocks per poll
+- **Ring buffer** - In-memory cache of recent blocks for fast catch-up
+- **Exponential backoff** - Automatic retries with backoff on rate limits and errors
+- **Production-ready** - Built for reliability and self-hosting
+
+## Self-Hosting
+
+Want to run your own instance? Deploy with Docker or build from source.
+
+### Docker
 
 ```bash
-# Stream from latest
-curl -N http://localhost:8080/stream
+docker pull ghcr.io/r-near/near-stream:latest
 
-# Resume from specific block
-curl -N "http://localhost:8080/stream?from_height=170727400"
+docker run -d \
+  -p 8080:8080 \
+  -e RUST_LOG=info \
+  ghcr.io/r-near/near-stream:latest
 ```
 
-**Client-side (JavaScript):**
+Server starts on `http://localhost:8080`
 
-```javascript
-const eventSource = new EventSource("/stream")
+### Build from Source
 
-eventSource.addEventListener("block", (event) => {
-  const block = JSON.parse(event.data)
-  console.log("Block", event.lastEventId, block)
-})
+```bash
+# Build
+cargo build --release
 
-eventSource.addEventListener("ping", (event) => {
-  console.log("Keep-alive or resync event")
-})
+# Run with defaults (mainnet)
+RUST_LOG=info cargo run --release
 
-// Automatic reconnection with Last-Event-ID
-eventSource.onerror = () => {
-  console.log("Connection lost, reconnecting...")
-  // Browser automatically sends Last-Event-ID header on reconnect
-}
+# Run with custom config
+NEARDATA_BASE=https://mainnet.neardata.xyz \
+RING_SIZE=512 \
+POLL_RETRY_MS=1000 \
+cargo run --release
 ```
 
-### `GET /healthz`
-
-Health check endpoint.
-
-**Response:**
-
-```json
-"ok"
-```
-
-## Configuration
+### Configuration
 
 All configuration via environment variables:
 
@@ -109,7 +126,7 @@ All configuration via environment variables:
 | `POLL_RETRY_MS` | Milliseconds between finality checks | `1000`                          |
 | `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                       |
 | `BIND_PORT`     | Server bind port                     | `8080`                          |
-| `RUST_LOG`      | Log level (tracing filter)           | `near_sse=info,tower_http=info` |
+| `RUST_LOG`      | Log level (tracing filter)           | `near_stream=info,tower_http=info` |
 
 ### Retry Behavior
 
@@ -119,8 +136,6 @@ The service automatically retries failed requests with exponential backoff:
 - **Backoff**: Exponentially increases (1s, 2s, 4s, 8s, 16s)
 - **Triggers**: 429 (rate limit), 5xx (server errors), network failures
 - **Jitter**: Prevents thundering herd on retry
-
-This means transient errors are handled automatically without manual intervention.
 
 ### Tuning Recommendations
 
@@ -139,20 +154,20 @@ RING_SIZE=1024  # More catch-up history
 **If consistently hitting rate limits:**
 
 ```bash
-POLL_RETRY_MS=2000  # Poll less frequently (automatic retries handle transient 429s)
+POLL_RETRY_MS=2000  # Poll less frequently
 ```
 
 **For verbose debugging:**
 
 ```bash
-RUST_LOG=near_sse=debug,tower_http=debug
+RUST_LOG=near_stream=debug,tower_http=debug
 ```
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     NEAR SSE Service                     │
+│                   NEAR Stream Service                    │
 ├─────────────────────────────────────────────────────────┤
 │                                                          │
 │  ┌──────────────┐         ┌─────────────────┐          │
