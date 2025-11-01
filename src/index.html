@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEAR Stream - Real-time blocks</title>
+    <meta name="description" content="Real-time Server-Sent Events stream for NEAR blockchain blocks. Free hosted service with automatic catch-up and resume support.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+        .block-item {
+            animation: slideIn 0.3s ease-out;
+        }
+        .pulse-dot {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: .5;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100">
+    <!-- Hero Section -->
+    <div class="min-h-screen flex flex-col">
+        <nav class="border-b border-gray-800">
+            <div class="container mx-auto px-4 py-4 flex justify-between items-center">
+                <div class="flex items-center gap-2">
+                    <svg class="w-8 h-8 text-emerald-500" fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zM8 7a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1H9a1 1 0 01-1-1V7zM14 4a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1h-2a1 1 0 01-1-1V4z" />
+                    </svg>
+                    <span class="text-xl font-bold">NEAR Stream</span>
+                </div>
+                <div class="flex gap-6">
+                    <a href="https://github.com/r-near/near-stream" target="_blank" class="text-gray-400 hover:text-gray-200 transition">GitHub</a>
+                </div>
+            </div>
+        </nav>
+
+        <div class="container mx-auto px-4 py-16 flex-1">
+            <div class="max-w-5xl mx-auto">
+                <!-- Hero -->
+                <div class="text-center mb-16">
+                    <h1 class="text-5xl md:text-6xl font-bold mb-6 bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent">
+                        Real-time NEAR blocks
+                    </h1>
+                    <p class="text-xl text-gray-400 mb-8 max-w-2xl mx-auto">
+                        Server-Sent Events stream for NEAR blocks. Free hosted service with automatic catch-up, resume support, and finality guarantees.
+                    </p>
+                    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+                        <a href="#quickstart" class="px-6 py-3 bg-emerald-600 hover:bg-emerald-700 rounded-lg font-medium transition">
+                            Get Started
+                        </a>
+                        <a href="https://github.com/r-near/near-stream" target="_blank" class="px-6 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg font-medium transition">
+                            View on GitHub
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Live Demo -->
+                <div class="mb-16">
+                    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                        <div class="flex items-center gap-2 mb-4">
+                            <span class="pulse-dot w-3 h-3 bg-emerald-500 rounded-full"></span>
+                            <h2 class="text-lg font-semibold">Live Stream</h2>
+                        </div>
+                        <div id="blocks" class="space-y-2 font-mono text-sm max-h-80 overflow-y-auto">
+                            <div class="text-gray-500">Connecting to stream...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Quick Start -->
+                <div id="quickstart" class="mb-16">
+                    <h2 class="text-3xl font-bold mb-6">Quick Start</h2>
+
+                    <div class="space-y-4">
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+                            <div class="px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm text-gray-400">
+                                cURL
+                            </div>
+                            <pre class="p-4 overflow-x-auto"><code class="text-gray-300">curl -N https://live.near.tools</code></pre>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+                            <div class="px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm text-gray-400">
+                                JavaScript / TypeScript
+                            </div>
+                            <pre class="p-4 overflow-x-auto"><code class="text-gray-300">const eventSource = new EventSource("https://live.near.tools")
+
+eventSource.addEventListener("block", (event) => {
+  const block = JSON.parse(event.data)
+  console.log("Block", event.lastEventId, block)
+})
+
+eventSource.addEventListener("ping", (event) => {
+  console.log("Keep-alive ping")
+})</code></pre>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+                            <div class="px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm text-gray-400">
+                                Resume from specific block
+                            </div>
+                            <pre class="p-4 overflow-x-auto"><code class="text-gray-300">curl -N "https://live.near.tools?from_height=170727400"</code></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Features Grid -->
+                <div id="features" class="mb-16">
+                    <h2 class="text-3xl font-bold mb-6">Features</h2>
+                    <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                            <div class="w-12 h-12 bg-emerald-500/10 rounded-lg flex items-center justify-center mb-4">
+                                <svg class="w-6 h-6 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold mb-2">Real-time streaming</h3>
+                            <p class="text-gray-400">Server-Sent Events endpoint for live NEAR block data as blocks are finalized.</p>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                            <div class="w-12 h-12 bg-cyan-500/10 rounded-lg flex items-center justify-center mb-4">
+                                <svg class="w-6 h-6 text-cyan-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold mb-2">Automatic catch-up</h3>
+                            <p class="text-gray-400">Resume from any block height with built-in ring buffer for fast catch-up.</p>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                            <div class="w-12 h-12 bg-purple-500/10 rounded-lg flex items-center justify-center mb-4">
+                                <svg class="w-6 h-6 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold mb-2">Finality guarantee</h3>
+                            <p class="text-gray-400">Only streams finalized blocks, ensuring data consistency and reliability.</p>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                            <div class="w-12 h-12 bg-orange-500/10 rounded-lg flex items-center justify-center mb-4">
+                                <svg class="w-6 h-6 text-orange-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold mb-2">Batch processing</h3>
+                            <p class="text-gray-400">Efficiently handles multiple new blocks per poll with smart batching.</p>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                            <div class="w-12 h-12 bg-pink-500/10 rounded-lg flex items-center justify-center mb-4">
+                                <svg class="w-6 h-6 text-pink-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold mb-2">Production-ready</h3>
+                            <p class="text-gray-400">Built for reliability with exponential backoff, retries, and structured logging.</p>
+                        </div>
+
+                        <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                            <div class="w-12 h-12 bg-blue-500/10 rounded-lg flex items-center justify-center mb-4">
+                                <svg class="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-semibold mb-2">Self-hostable</h3>
+                            <p class="text-gray-400">Open source and easy to deploy with Docker or build from source.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- API Docs -->
+                <div id="docs" class="mb-16">
+                    <h2 class="text-3xl font-bold mb-6">API Documentation</h2>
+
+                    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 mb-6">
+                        <h3 class="text-xl font-semibold mb-3">
+                            <code class="text-emerald-400">GET /</code>
+                        </h3>
+                        <p class="text-gray-400 mb-4">
+                            Server-Sent Events endpoint for real-time block streaming.
+                        </p>
+
+                        <h4 class="font-semibold mb-2">Query Parameters</h4>
+                        <div class="bg-gray-950 rounded p-4 mb-4">
+                            <code class="text-sm">
+                                <span class="text-cyan-400">from_height</span>
+                                <span class="text-gray-500">(optional)</span> -
+                                <span class="text-gray-300">Resume stream from block height (exclusive)</span>
+                            </code>
+                        </div>
+
+                        <h4 class="font-semibold mb-2">Event Format</h4>
+                        <pre class="bg-gray-950 rounded p-4 text-sm overflow-x-auto"><code class="text-gray-300">event: block
+id: 170727400
+data: {"block_height":170727400,"block_hash":"...","prev_block_hash":"...",...}
+
+event: block
+id: 170727401
+data: {"block_height":170727401,...}</code></pre>
+                    </div>
+
+                    <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+                        <h3 class="text-xl font-semibold mb-3">
+                            <code class="text-emerald-400">GET /healthz</code>
+                        </h3>
+                        <p class="text-gray-400">
+                            Health check endpoint. Returns <code class="text-gray-300 bg-gray-950 px-2 py-1 rounded">"ok"</code> as JSON.
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Self-Hosting -->
+                <div class="mb-16">
+                    <h2 class="text-3xl font-bold mb-6">Self-Hosting</h2>
+
+                    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden mb-6">
+                        <div class="px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm text-gray-400">
+                            Docker
+                        </div>
+                        <pre class="p-4 overflow-x-auto"><code class="text-gray-300">docker pull ghcr.io/r-near/near-stream:latest
+
+docker run -d \
+  -p 8080:8080 \
+  -e RUST_LOG=info \
+  ghcr.io/r-near/near-stream:latest</code></pre>
+                    </div>
+
+                    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+                        <div class="px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm text-gray-400">
+                            Build from source
+                        </div>
+                        <pre class="p-4 overflow-x-auto"><code class="text-gray-300">cargo build --release
+RUST_LOG=info cargo run --release</code></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="border-t border-gray-800 mt-16">
+            <div class="container mx-auto px-4 py-8">
+                <div class="flex flex-col md:flex-row justify-between items-center gap-4">
+                    <div class="text-gray-400 text-sm">
+                        Built with <a href="https://github.com/tokio-rs/axum" class="text-emerald-500 hover:text-emerald-400">axum</a> and <a href="https://neardata.xyz" class="text-emerald-500 hover:text-emerald-400">neardata.xyz</a>
+                    </div>
+                    <div class="flex gap-6">
+                        <a href="https://github.com/r-near/near-stream" target="_blank" class="text-gray-400 hover:text-gray-200 transition">
+                            <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                                <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" />
+                            </svg>
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        const blocksContainer = document.getElementById('blocks');
+        const maxBlocks = 10;
+
+        const eventSource = new EventSource('/');
+
+        eventSource.addEventListener('block', (event) => {
+            try {
+                const block = JSON.parse(event.data);
+                const blockHeight = block.block?.header?.height || event.lastEventId;
+                const blockHash = block.block?.header?.hash || 'unknown';
+                const timestamp = new Date().toLocaleTimeString();
+
+                // Truncate hash
+                const truncatedHash = blockHash.length > 13
+                    ? blockHash.substring(0, 6) + '...' + blockHash.substring(blockHash.length - 6)
+                    : blockHash;
+
+                // Add new block to the top
+                addBlock(blockHeight, truncatedHash, blockHash, timestamp);
+            } catch (e) {
+                console.error('Error parsing block:', e);
+            }
+        });
+
+        eventSource.addEventListener('ping', () => {
+            // Keep-alive, no action needed
+        });
+
+        eventSource.onerror = () => {
+            blocksContainer.innerHTML = '<div class="text-red-400">Connection lost, reconnecting...</div>';
+        };
+
+        eventSource.onopen = () => {
+            if (blocksContainer.children.length === 0) {
+                blocksContainer.innerHTML = '<div class="text-gray-500">Waiting for blocks...</div>';
+            }
+        };
+
+        function addBlock(height, truncatedHash, fullHash, timestamp) {
+            // Clear "waiting" message if present
+            if (blocksContainer.children.length === 1 && blocksContainer.children[0].classList.contains('text-gray-500')) {
+                blocksContainer.innerHTML = '';
+            }
+
+            // Create new block element
+            const blockEl = document.createElement('a');
+            blockEl.href = `https://nearblocks.io/blocks/${height}`;
+            blockEl.target = '_blank';
+            blockEl.className = 'block-item flex items-center gap-4 p-3 bg-gray-800/50 rounded border border-gray-700/50 hover:border-emerald-500/50 transition cursor-pointer';
+            blockEl.innerHTML = `
+                <div class="flex-shrink-0">
+                    <div class="w-2 h-2 bg-emerald-500 rounded-full"></div>
+                </div>
+                <div class="flex-1 flex flex-col sm:flex-row sm:items-center gap-2">
+                    <span class="text-emerald-400 font-semibold">#${height}</span>
+                    <span class="text-gray-500 hidden sm:inline">•</span>
+                    <span class="text-gray-400 break-all" title="${fullHash}">${truncatedHash}</span>
+                </div>
+                <div class="text-gray-500 text-xs flex-shrink-0">${timestamp}</div>
+            `;
+
+            // Insert at the top
+            blocksContainer.insertBefore(blockEl, blocksContainer.firstChild);
+
+            // Remove oldest block if we exceed max
+            while (blocksContainer.children.length > maxBlocks) {
+                blocksContainer.removeChild(blocksContainer.lastChild);
+            }
+        }
+    </script>
+</body>
+</html>

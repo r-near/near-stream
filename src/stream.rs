@@ -7,7 +7,8 @@
 
 use axum::{
     extract::{Query, State},
-    response::sse::{Event, KeepAlive, Sse},
+    http::{header, HeaderMap},
+    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Response},
     Json,
 };
 use futures::stream::{self, Stream, StreamExt};
@@ -118,22 +119,65 @@ pub struct StreamQuery {
     from_height: Option<u64>,
 }
 
-/// SSE endpoint handler
+/// Check if request is from a browser based on User-Agent and Accept headers
+fn is_browser_request(headers: &HeaderMap) -> bool {
+    // First check: If Accept header explicitly requests text/event-stream, serve SSE
+    // (This handles EventSource requests from the browser)
+    if let Some(accept) = headers.get(header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            if accept_str.contains("text/event-stream") {
+                return false; // Not a browser page request, it's an EventSource request
+            }
+        }
+    }
+
+    // Second check: If Accept header prefers text/html, serve HTML
+    if let Some(accept) = headers.get(header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            if accept_str.contains("text/html") {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: Check User-Agent for common browsers
+    if let Some(ua) = headers.get(header::USER_AGENT) {
+        if let Ok(ua_str) = ua.to_str() {
+            if ua_str.contains("Mozilla") || ua_str.contains("Chrome") || ua_str.contains("Safari") || ua_str.contains("Edge") {
+                // Only serve HTML if it's not curl (which also has Mozilla in some versions)
+                return !ua_str.starts_with("curl");
+            }
+        }
+    }
+
+    false
+}
+
+/// SSE endpoint handler that serves HTML for browsers and SSE for API clients
 pub async fn stream_handler(
+    headers: HeaderMap,
     State(state): State<StreamState>,
     Query(query): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let resume_from = query.from_height;
+) -> Response {
+    // If request is from a browser, serve HTML homepage
+    if is_browser_request(&headers) {
+        info!("Serving HTML homepage to browser");
+        return Html(include_str!("index.html")).into_response();
+    }
 
+    // Otherwise, serve SSE stream
+    let resume_from = query.from_height;
     info!(?resume_from, "New SSE client connected");
 
     let event_stream = create_sse_stream(state, resume_from);
 
-    Sse::new(event_stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(30))
-            .text("keep-alive"),
-    )
+    Sse::new(event_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 /// Health check endpoint
