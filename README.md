@@ -1,6 +1,6 @@
 # NEAR Stream
 
-Real-time Server-Sent Events (SSE) stream for NEAR blockchain blocks.
+Real-time Server-Sent Events (SSE) stream for NEAR blockchain blocks. Powered by [neardata.xyz](https://neardata.xyz).
 
 ## Hosted Service
 
@@ -119,13 +119,13 @@ cargo run --release
 
 All configuration via environment variables:
 
-| Variable        | Description                          | Default                         |
-| --------------- | ------------------------------------ | ------------------------------- |
-| `NEARDATA_BASE` | neardata.xyz API base URL            | `https://mainnet.neardata.xyz`  |
-| `RING_SIZE`     | Number of recent blocks to cache     | `256`                           |
-| `POLL_RETRY_MS` | Milliseconds between finality checks | `1000`                          |
-| `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                       |
-| `BIND_PORT`     | Server bind port                     | `8080`                          |
+| Variable        | Description                          | Default                            |
+| --------------- | ------------------------------------ | ---------------------------------- |
+| `NEARDATA_BASE` | neardata.xyz API base URL            | `https://mainnet.neardata.xyz`     |
+| `RING_SIZE`     | Number of recent blocks to cache     | `256`                              |
+| `POLL_RETRY_MS` | Milliseconds between finality checks | `1000`                             |
+| `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                          |
+| `BIND_PORT`     | Server bind port                     | `8080`                             |
 | `RUST_LOG`      | Log level (tracing filter)           | `near_stream=info,tower_http=info` |
 
 ### Retry Behavior
@@ -167,29 +167,29 @@ RUST_LOG=near_stream=debug,tower_http=debug
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   NEAR Stream Service                    │
+│                   NEAR Stream Service                   │
 ├─────────────────────────────────────────────────────────┤
-│                                                          │
-│  ┌──────────────┐         ┌─────────────────┐          │
-│  │   Ingestor   │────────▶│ Broadcast Chan  │          │
-│  │              │         │  (tokio::mpsc)  │          │
-│  │ - Polls      │         └────────┬────────┘          │
+│                                                         │
+│  ┌──────────────┐         ┌─────────────────┐           │
+│  │   Ingestor   │───────▶│ Broadcast Chan   │           │
+│  │              │         │  (tokio::mpsc)  │           │
+│  │ - Polls      │         └────────┬────────┘           │
 │  │   /v0/last_  │                  │                    │
 │  │   block/final│                  │                    │
-│  │ - Fetches    │         ┌────────▼────────┐          │
-│  │   blocks     │         │  Ring Buffer    │          │
-│  │ - Batch      │         │   Updater       │          │
-│  │   catch-up   │         │                 │          │
-│  └──────────────┘         └─────────────────┘          │
-│                                                          │
-│                           ┌─────────────────┐          │
-│  ┌──────────────┐        │  Ring Buffer    │          │
-│  │ SSE Handler  │◀───────│  (VecDeque)     │          │
-│  │              │        │                 │          │
-│  │ - Catch-up   │        │  - 256 blocks   │          │
-│  │ - Live       │        │  - Fast resume  │          │
-│  │   stream     │        └─────────────────┘          │
-│  └──────────────┘                                      │
+│  │ - Fetches    │         ┌────────▼────────┐           │
+│  │   blocks     │         │  Ring Buffer    │           │
+│  │ - Batch      │         │   Updater       │           │
+│  │   catch-up   │         │                 │           │
+│  └──────────────┘         └─────────────────┘           │
+│                                                         │
+│                          ┌─────────────────┐            │
+│  ┌──────────────┐        │  Ring Buffer    │            │
+│  │ SSE Handler  │◀──────│  (VecDeque)      │           │
+│  │              │        │                 │            │
+│  │ - Catch-up   │        │  - 256 blocks   │            │
+│  │ - Live       │        │  - Fast resume  │            │
+│  │   stream     │        └─────────────────┘            │
+│  └──────────────┘                                       │
 │         │                                               │
 └─────────┼───────────────────────────────────────────────┘
           │

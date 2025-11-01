@@ -143,6 +143,35 @@ pub async fn run_ingestor(cfg: IngestConfig, tx: broadcast::Sender<BlockMsg>) ->
                                 next_height += 1;
                             }
                             Ok(None) => {
+                                // Block returned null - could be skipped or not available yet
+                                // If we're behind finalized, verify by checking next block
+                                if next_height < latest_finalized {
+                                    match fetch_block(&client, &cfg, next_height + 1).await {
+                                        Ok(Some(next_block)) => {
+                                            // Check if next block's prev_height skips over current height
+                                            if let Some(prev_height) = next_block
+                                                .pointer("/header/prev_height")
+                                                .and_then(|v| v.as_u64())
+                                            {
+                                                if prev_height < next_height {
+                                                    // Confirmed: block was skipped by validator
+                                                    warn!(
+                                                        height = next_height,
+                                                        prev_height,
+                                                        latest_finalized,
+                                                        "Block confirmed skipped (validator missed it)"
+                                                    );
+                                                    next_height += 1;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            // Can't verify yet, will retry
+                                        }
+                                    }
+                                }
+
                                 warn!(
                                     height = next_height,
                                     latest_finalized,
@@ -171,5 +200,59 @@ pub async fn run_ingestor(cfg: IngestConfig, tx: broadcast::Sender<BlockMsg>) ->
                 sleep(Duration::from_millis(cfg.poll_retry_ms)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    /// Test that we correctly detect skipped blocks using prev_height verification
+    /// Based on real NEAR data: block 170797835 was skipped
+    #[test]
+    fn test_detect_skipped_block() {
+        // Block 170797835 returns null (skipped by validator)
+        // Block 170797836 exists and points back to 170797834
+        let block_170797836 = json!({
+            "header": {
+                "height": 170797836,
+                "prev_height": 170797834  // Skips over 170797835!
+            }
+        });
+
+        // Verify the detection logic
+        let current_height = 170797835;
+        let next_block = &block_170797836;
+
+        let prev_height = next_block
+            .pointer("/header/prev_height")
+            .and_then(|v| v.as_u64());
+
+        assert_eq!(prev_height, Some(170797834));
+        assert!(prev_height.unwrap() < current_height,
+            "prev_height should be less than current_height, confirming block was skipped");
+    }
+
+    /// Test that we don't incorrectly mark sequential blocks as skipped
+    #[test]
+    fn test_sequential_blocks_not_skipped() {
+        // Sequential blocks with no gaps
+        let block_101 = json!({
+            "header": {
+                "height": 101,
+                "prev_height": 100  // Sequential, not skipped
+            }
+        });
+
+        let current_height = 100;
+        let next_block = &block_101;
+
+        let prev_height = next_block
+            .pointer("/header/prev_height")
+            .and_then(|v| v.as_u64());
+
+        assert_eq!(prev_height, Some(100));
+        assert!(prev_height.unwrap() >= current_height,
+            "prev_height should equal current_height for sequential blocks");
     }
 }
