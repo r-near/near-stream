@@ -1,0 +1,22 @@
+# Git
+.git
+.gitignore
+.github
+
+# Build artifacts
+target/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+README.md
+*.md
+
+# CI/CD
+.dockerignore
+Dockerfile

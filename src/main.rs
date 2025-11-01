@@ -1,342 +1,123 @@
-use actix_web::http::header;
-use actix_web::{
-    get,
-    web::{Data, Query},
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
-};
-use futures_util::Stream;
-use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{
-    collections::VecDeque,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
-use tokio::sync::broadcast;
-use tokio::time::sleep;
+//! NEAR SSE - Server-Sent Events stream for NEAR blockchain blocks
+//!
+//! A lightweight service that ingests NEAR blocks from neardata.xyz and streams
+//! them to clients via SSE with automatic catch-up support.
 
-// -------------------------------
-// Config
-// -------------------------------
+mod ingest;
+mod stream;
+mod types;
 
+use axum::{routing::get, Router};
+use std::env;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use ingest::{run_ingestor, IngestConfig};
+use stream::{health_handler, stream_handler, StreamState};
+
+/// Application configuration loaded from environment variables
 #[derive(Clone)]
-struct AppConfig {
-    neardata_base: String, // e.g. https://mainnet.neardata.xyz
-    ring_size: usize,      // e.g. 256
-    poll_retry_ms: u64,    // wait between polls when no new block yet
+struct Config {
+    neardata_base: String,
+    ring_size: usize,
+    poll_retry_ms: u64,
+    bind_addr: String,
+    bind_port: u16,
 }
 
-// -------------------------------
-// Data model we broadcast
-// -------------------------------
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BlockMsg {
-    height: u64,
-    block: Value, // full JSON from neardata for that block
-}
-
-// -------------------------------
-// Shared state
-// -------------------------------
-
-#[derive(Clone)]
-struct SharedState {
-    // ring buffer of recent blocks
-    ring: Arc<RwLock<VecDeque<BlockMsg>>>,
-    // broadcast channel for live subscribers
-    tx: broadcast::Sender<BlockMsg>,
-    // config
-    cfg: AppConfig,
-}
-
-// Helper: push into ring buffer w/ max capacity
-fn push_ring(ring: &mut VecDeque<BlockMsg>, msg: BlockMsg, cap: usize) {
-    if ring.len() == cap {
-        ring.pop_front();
-    }
-    ring.push_back(msg);
-}
-
-// -------------------------------
-// Block ingestion task
-// -------------------------------
-//
-// Loop:
-//  1. discover the latest finalized block height from /v0/last_block/final
-//     (that endpoint redirects to /v0/block/<height>)
-//  2. walk forward 1-by-1 with /v0/block/<height>
-//  3. for each new block, store + broadcast
-//
-
-async fn discover_latest_final_height(cfg: &AppConfig) -> anyhow::Result<u64> {
-    info!(
-        "Discovering latest finalized block height from {}",
-        cfg.neardata_base
-    );
-    // We'll GET /v0/last_block/final and rely on the redirect URL to infer height.
-    // FastNEAR docs say it redirects to a concrete /v0/block/<block_height>.
-    let url = format!("{}/v0/last_block/final", cfg.neardata_base);
-    let resp = reqwest::get(&url).await?;
-    let final_url = resp.url().clone(); // after redirects
-                                        // final_url should end with /v0/block/<height>
-                                        // we'll parse the last path segment
-    let segments = final_url.path().split('/').collect::<Vec<_>>();
-    let last_seg = segments
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("bad redirect url"))?;
-    let h: u64 = last_seg.parse()?;
-    info!("Latest finalized height: {}", h);
-    Ok(h)
-}
-
-async fn fetch_block(cfg: &AppConfig, height: u64) -> anyhow::Result<Option<Value>> {
-    let url = format!("{}/v0/block/{}", cfg.neardata_base, height);
-    let resp = reqwest::get(&url).await?;
-
-    if resp.status().is_success() {
-        let v: Value = resp.json().await?;
-        // FastNEAR contract: if block doesn't exist => `null`
-        if v.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(v))
-        }
-    } else {
-        // Non-200 could be transient
-        Ok(None)
-    }
-}
-
-async fn run_ingestor(state: SharedState) -> anyhow::Result<()> {
-    info!("Starting block ingestor");
-    // 1. Get last finalized height to seed the loop.
-    let mut next_height = discover_latest_final_height(&state.cfg).await?;
-
-    loop {
-        info!("Attempting to fetch block {}", next_height);
-        match fetch_block(&state.cfg, next_height).await {
-            Ok(Some(block_json)) => {
-                // Try to read height from URL rather than trusting JSON layout.
-                // But we already know `next_height`.
-                let msg = BlockMsg {
-                    height: next_height,
-                    block: block_json,
-                };
-
-                // Save to ring buffer
-                {
-                    let mut ring = state.ring.write().unwrap();
-                    push_ring(&mut ring, msg.clone(), state.cfg.ring_size);
-                }
-
-                // Broadcast to all subscribers
-                let _ = state.tx.send(msg);
-
-                info!("Fetched and broadcasted block {}", next_height);
-                // advance
-                next_height += 1;
-                // no sleep: try immediate next block
-            }
-            Ok(None) => {
-                // Block not ready yet, chill a bit
-                warn!(
-                    "Block {} not ready yet, retrying in {}ms",
-                    next_height, state.cfg.poll_retry_ms
-                );
-                sleep(Duration::from_millis(state.cfg.poll_retry_ms)).await;
-            }
-            Err(err) => {
-                error!("Error fetching block {}: {:?}", next_height, err);
-                // On error we don't want to spin at 100% CPU.
-                sleep(Duration::from_millis(state.cfg.poll_retry_ms)).await;
-            }
+impl Config {
+    fn from_env() -> Self {
+        Self {
+            neardata_base: env::var("NEARDATA_BASE")
+                .unwrap_or_else(|_| "https://mainnet.neardata.xyz".to_string()),
+            ring_size: env::var("RING_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(256),
+            poll_retry_ms: env::var("POLL_RETRY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
+            bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            bind_port: env::var("BIND_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
         }
     }
 }
 
-// -------------------------------
-// SSE response builder
-// -------------------------------
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "near_sse=info,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-fn format_sse_event(msg: &BlockMsg) -> String {
-    // We emit one SSE event per block:
-    // event: block
-    // id: <height>
-    // data: <json...>
-    // \n
-    let json_str = serde_json::to_string(&msg.block).unwrap_or("null".to_string());
-    format!("event: block\nid: {}\ndata: {}\n\n", msg.height, json_str)
-}
-
-// We'll stream using an async Stream of Bytes
-fn sse_stream(
-    state: SharedState,
-    resume_from: Option<u64>,
-) -> impl Stream<Item = Result<actix_web::web::Bytes, actix_web::Error>> {
-    use futures_util::stream::{self, StreamExt};
-
-    // Step 1. Snapshot ring buffer for catch-up.
-    let catchup: Vec<String> = {
-        let ring = state.ring.read().unwrap();
-        ring.iter()
-            .filter(|m| {
-                if let Some(h) = resume_from {
-                    m.height > h
-                } else {
-                    true
-                }
-            })
-            .map(|m| format_sse_event(m))
-            .collect()
-    };
-
-    // Step 2. Subscribe to broadcast for live.
-    let rx = state.tx.subscribe();
-
-    // Convert catchup Vec<String> into a stream first,
-    // then chain a live stream that waits on rx.recv().
-    let catchup_stream = stream::iter(
-        catchup
-            .into_iter()
-            .map(|s| Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(s))),
-    );
-
-    let live_stream = stream::unfold(rx, move |mut rx| async move {
-        match rx.recv().await {
-            Ok(msg) => {
-                let frame = format_sse_event(&msg);
-                Some((
-                    Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(frame)),
-                    rx,
-                ))
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!("Subscriber lagged, skipped {} msgs", skipped);
-                // even if lagged, continue trying
-                Some((
-                    Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(
-                        "event: ping\ndata: \"resync\"\n\n",
-                    )),
-                    rx,
-                ))
-            }
-            Err(_) => {
-                // Sender closed. In practice this should never happen unless shutdown.
-                None
-            }
-        }
-    });
-
-    catchup_stream.chain(live_stream)
-}
-
-// -------------------------------
-// HTTP handlers
-// -------------------------------
-
-#[derive(Deserialize)]
-struct StreamQuery {
-    from_height: Option<u64>,
-}
-
-#[get("/stream")]
-async fn stream_handler(
-    req: HttpRequest,
-    q: Query<StreamQuery>,
-    state: Data<SharedState>,
-) -> impl Responder {
-    // 1. figure out resume cursor
-    // Priority: query.from_height > Last-Event-ID header
-    let mut resume_from = q.from_height;
-
-    if resume_from.is_none() {
-        if let Some(last_id_hdr) = req.headers().get("Last-Event-ID") {
-            if let Ok(s) = last_id_hdr.to_str() {
-                if let Ok(h) = s.parse::<u64>() {
-                    resume_from = Some(h);
-                }
-            }
-        }
-    }
-
-    info!("New SSE stream connection, resume_from={:?}", resume_from);
-    // 2. build streaming body
-    let event_stream = sse_stream(state.get_ref().clone(), resume_from);
-
-    // 3. build response
-    HttpResponse::Ok()
-        .insert_header((header::CONTENT_TYPE, "text/event-stream"))
-        .insert_header((header::CACHE_CONTROL, "no-cache"))
-        .insert_header((header::CONNECTION, "keep-alive"))
-        .streaming(event_stream)
-}
-
-#[get("/healthz")]
-async fn health() -> impl Responder {
-    info!("Health check requested");
-    HttpResponse::Ok().body("ok")
-}
-
-// -------------------------------
-// main
-// -------------------------------
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init();
-    // read env
-    let neardata_base = std::env::var("NEARDATA_BASE")
-        .unwrap_or_else(|_| "https://mainnet.neardata.xyz".to_string());
-    let ring_size: usize = std::env::var("RING_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
-    let poll_retry_ms: u64 = std::env::var("POLL_RETRY_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(500);
-
-    let cfg = AppConfig {
-        neardata_base,
-        ring_size,
-        poll_retry_ms,
-    };
+    let config = Config::from_env();
 
     info!(
-        "Starting NEAR SSE server with config: neardata_base={}, ring_size={}, poll_retry_ms={}",
-        cfg.neardata_base, cfg.ring_size, cfg.poll_retry_ms
+        neardata_base = %config.neardata_base,
+        ring_size = config.ring_size,
+        poll_retry_ms = config.poll_retry_ms,
+        "Starting NEAR SSE server"
     );
 
-    // broadcast channel
-    let (tx, _rx) = broadcast::channel::<BlockMsg>(1024);
+    // Create shared stream state
+    let stream_state = StreamState::new(config.ring_size);
 
-    let shared_state = SharedState {
-        ring: Arc::new(RwLock::new(VecDeque::with_capacity(cfg.ring_size))),
-        tx,
-        cfg: cfg.clone(),
-    };
-
-    // spawn ingestor task
+    // Spawn ingestor task
     {
-        let st = shared_state.clone();
+        let ingest_cfg = IngestConfig {
+            neardata_base: config.neardata_base.clone(),
+            poll_retry_ms: config.poll_retry_ms,
+        };
+        let tx = stream_state.broadcaster();
+
         tokio::spawn(async move {
-            if let Err(e) = run_ingestor(st).await {
-                error!("Ingestor crashed: {:?}", e);
+            if let Err(e) = run_ingestor(ingest_cfg, tx).await {
+                error!(error = ?e, "Ingestor task failed");
             }
         });
     }
 
-    info!("Starting HTTP server on 0.0.0.0:8080");
-    // start HTTP server
-    HttpServer::new(move || {
-        App::new()
-            .app_data(Data::new(shared_state.clone()))
-            .service(stream_handler)
-            .service(health)
-    })
-    .bind(("0.0.0.0", 8080))?
-    .run()
-    .await
+    // Spawn ring buffer updater task (subscribes to broadcasts and updates ring)
+    {
+        let state = stream_state.clone();
+        let mut rx = state.subscribe();
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => state.push_block(msg),
+                    Err(e) => {
+                        error!(error = ?e, "Ring buffer updater error");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Build router
+    let app = Router::new()
+        .route("/stream", get(stream_handler))
+        .route("/healthz", get(health_handler))
+        .layer(TraceLayer::new_for_http())
+        .with_state(stream_state);
+
+    // Start HTTP server
+    let bind = format!("{}:{}", config.bind_addr, config.bind_port);
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+
+    info!(addr = %bind, "Starting HTTP server");
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
