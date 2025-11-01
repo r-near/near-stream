@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router
     let app = Router::new()
-        .route("/blocks", get(stream_handler))
+        .route("/", get(stream_handler))
         .route("/healthz", get(health_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(stream_state);

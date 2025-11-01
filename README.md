@@ -4,20 +4,20 @@ Real-time Server-Sent Events (SSE) stream for NEAR blockchain blocks.
 
 ## Hosted Service
 
-Use the free hosted service at **[stream.near.tools](https://stream.near.tools)**
+Use the free hosted service at **[live.near.tools](https://live.near.tools)**
 
 ### Quick Start
 
 **Stream from latest block:**
 
 ```bash
-curl -N https://stream.near.tools/blocks
+curl -N https://live.near.tools
 ```
 
 **JavaScript/TypeScript:**
 
 ```javascript
-const eventSource = new EventSource("https://stream.near.tools/blocks")
+const eventSource = new EventSource("https://live.near.tools")
 
 eventSource.addEventListener("block", (event) => {
   const block = JSON.parse(event.data)
@@ -38,12 +38,12 @@ eventSource.onerror = () => {
 **Resume from specific block:**
 
 ```bash
-curl -N "https://stream.near.tools/blocks?from_height=170727400"
+curl -N "https://live.near.tools?from_height=170727400"
 ```
 
 ### API Endpoints
 
-#### `GET /blocks`
+#### `GET /`
 
 Server-Sent Events endpoint for real-time block streaming.
 
