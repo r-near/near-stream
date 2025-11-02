@@ -5,6 +5,9 @@
 //! - Rate limiting
 //! - API lag (blocks not available immediately)
 //! - Consecutive skipped blocks
+//!
+//! NOTE: Run with `--test-threads=1` to avoid Redis stream name conflicts:
+//! `cargo test --test ingest_integration_test -- --test-threads=1`
 
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,13 +83,19 @@ async fn test_skipped_block_via_lookahead() {
     // Block 103 - to keep it going
     Mock::given(method("GET"))
         .and(path("/v0/block/103"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&mock_block(103, 102)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(103, 102)))
         .mount(&mock_server)
         .await;
 
-    // Setup Redis
+    // Setup Redis and flush all data
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+
+    // Flush entire database to ensure clean state for height-based IDs
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut redis_conn)
         .await
         .unwrap();
 
@@ -154,14 +163,20 @@ async fn test_rate_limit_causes_backoff() {
             if count < 2 {
                 ResponseTemplate::new(429) // Rate limited
             } else {
-                ResponseTemplate::new(200).set_body_json(&mock_block(201, 200))
+                ResponseTemplate::new(200).set_body_json(mock_block(201, 200))
             }
         })
         .mount(&mock_server)
         .await;
 
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+
+    // Flush entire database to ensure clean state for height-based IDs
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut redis_conn)
         .await
         .unwrap();
 
@@ -227,7 +242,7 @@ async fn test_api_lag_eventually_succeeds() {
             if count < 3 {
                 ResponseTemplate::new(200).set_body_json(serde_json::Value::Null)
             } else {
-                ResponseTemplate::new(200).set_body_json(&mock_block(301, 300))
+                ResponseTemplate::new(200).set_body_json(mock_block(301, 300))
             }
         })
         .mount(&mock_server)
@@ -237,13 +252,19 @@ async fn test_api_lag_eventually_succeeds() {
     for height in 302..=310 {
         Mock::given(method("GET"))
             .and(path(format!("/v0/block/{}", height)))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&mock_block(height, height - 1)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(height, height - 1)))
             .mount(&mock_server)
             .await;
     }
 
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+
+    // Flush entire database to ensure clean state for height-based IDs
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut redis_conn)
         .await
         .unwrap();
 
@@ -255,8 +276,8 @@ async fn test_api_lag_eventually_succeeds() {
         near_stream::ingest::run_ingestor(config, redis_conn).await
     });
 
-    // Wait for block to eventually be available
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    // Wait for block to eventually be available (longer timeout for test concurrency)
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Should have tried multiple times before succeeding
     let attempts = lag_attempts.load(Ordering::SeqCst);
@@ -329,7 +350,7 @@ async fn test_immediate_finality_check_on_unavailable_block() {
     // Block 504 onwards are available - block 504 points to 500 (skipping 501-503)
     Mock::given(method("GET"))
         .and(path("/v0/block/504"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&mock_block(504, 500)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(504, 500)))
         .mount(&mock_server)
         .await;
 
@@ -337,13 +358,19 @@ async fn test_immediate_finality_check_on_unavailable_block() {
     for height in 505..=525 {
         Mock::given(method("GET"))
             .and(path(format!("/v0/block/{}", height)))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&mock_block(height, height - 1)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(height, height - 1)))
             .mount(&mock_server)
             .await;
     }
 
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+
+    // Flush entire database to ensure clean state for height-based IDs
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut redis_conn)
         .await
         .unwrap();
 
@@ -444,12 +471,18 @@ async fn test_consecutive_skipped_blocks() {
 
     Mock::given(method("GET"))
         .and(path("/v0/block/404"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&mock_block(404, 403)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(404, 403)))
         .mount(&mock_server)
         .await;
 
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+
+    // Flush entire database to ensure clean state for height-based IDs
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut redis_conn)
         .await
         .unwrap();
 

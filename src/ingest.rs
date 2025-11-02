@@ -108,26 +108,10 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
 
     let client = create_http_client();
     let mut next_height = discover_latest_height(&client, &cfg).await?;
-    let mut latest_finalized = next_height;
-    let mut last_finality_check = tokio::time::Instant::now();
 
     info!(next_height, "Starting optimistic ingestion from block");
 
     loop {
-        // Periodically refresh latest finalized height (every 30 seconds)
-        if last_finality_check.elapsed() > Duration::from_secs(30) {
-            match discover_latest_height(&client, &cfg).await {
-                Ok(height) => {
-                    latest_finalized = height;
-                    last_finality_check = tokio::time::Instant::now();
-                    info!(latest_finalized, next_height, "Refreshed latest finalized height");
-                }
-                Err(e) => {
-                    warn!(error = ?e, "Failed to refresh latest finalized height, continuing");
-                }
-            }
-        }
-
         // Optimistically fetch next block
         match fetch_block(&client, &cfg, next_height).await {
             Ok(BlockFetchResult::Found(block)) => {
@@ -146,20 +130,7 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
             }
             Ok(BlockFetchResult::NotAvailable) => {
                 // Block returned null - could be skipped or not available yet
-                // Use latest finalized height to determine if definitely skipped
-
-                if next_height + 10 < latest_finalized {
-                    // We're far behind finalized - this block is definitely skipped
-                    warn!(
-                        height = next_height,
-                        latest_finalized,
-                        "Block skipped (well below finalized height)"
-                    );
-                    next_height += 1;
-                    continue;
-                }
-
-                // We're near the chain head - use lookahead to verify
+                // Use lookahead to verify, then check finality if needed
                 sleep(Duration::from_millis(200)).await;
 
                 let mut found_confirmation = false;
@@ -222,12 +193,9 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
 
                 if !found_confirmation {
                     // Couldn't find any block in lookahead range
-                    // Refresh finalized height to check if block was actually skipped
+                    // Check finalized height to determine if block was skipped
                     match discover_latest_height(&client, &cfg).await {
-                        Ok(height) => {
-                            latest_finalized = height;
-                            last_finality_check = tokio::time::Instant::now();
-
+                        Ok(latest_finalized) => {
                             if next_height + 10 < latest_finalized {
                                 // Block was definitely skipped - chain moved ahead
                                 warn!(
