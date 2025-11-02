@@ -122,41 +122,61 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
             }
             Ok(None) => {
                 // Block returned null - could be skipped or not available yet
-                // Try to verify by checking next block, but only if we're not being rate limited
+                // Try to verify by checking next blocks (look ahead up to 5 blocks)
+                // to handle consecutive skipped blocks
 
-                // Add a small delay before checking next block to avoid rapid-fire requests
                 sleep(Duration::from_millis(200)).await;
 
-                match fetch_block(&client, &cfg, next_height + 1).await {
-                    Ok(Some(next_block)) => {
-                        // Check if next block's prev_height skips over current height
-                        if let Some(prev_height) = next_block
-                            .pointer("/header/prev_height")
-                            .and_then(|v| v.as_u64())
-                        {
-                            if prev_height < next_height {
-                                // Confirmed: block was skipped by validator
-                                warn!(
-                                    height = next_height,
-                                    prev_height,
-                                    "Block skipped by validator"
-                                );
-                                next_height += 1;
-                                continue;
+                let mut found_confirmation = false;
+
+                // Look ahead up to 5 blocks to detect consecutive skipped blocks
+                for lookahead in 1..=5 {
+                    match fetch_block(&client, &cfg, next_height + lookahead).await {
+                        Ok(Some(block)) => {
+                            // Found a block - check its prev_height
+                            if let Some(prev_height) = block
+                                .pointer("/header/prev_height")
+                                .and_then(|v| v.as_u64())
+                            {
+                                if prev_height < next_height {
+                                    // Confirmed: current block was skipped
+                                    warn!(
+                                        height = next_height,
+                                        prev_height,
+                                        lookahead_height = next_height + lookahead,
+                                        "Block skipped by validator (detected via lookahead)"
+                                    );
+                                    next_height += 1;
+                                    found_confirmation = true;
+                                    break;
+                                } else if prev_height == next_height {
+                                    // Next block points to current block, so current block exists
+                                    // but just isn't available yet
+                                    info!(height = next_height, "Block not available yet, waiting");
+                                    sleep(Duration::from_secs(1)).await;
+                                    found_confirmation = true;
+                                    break;
+                                }
+                                // prev_height > next_height means there might be multiple skips
+                                // Continue looking ahead
                             }
                         }
-                        // Next block exists but doesn't skip current block
-                        // Current block must not be available yet
-                        info!(height = next_height, "Block not available yet, waiting");
-                        sleep(Duration::from_secs(1)).await;
+                        Ok(None) => {
+                            // This lookahead block is also null, try next lookahead
+                            sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Error fetching lookahead block, stop trying
+                            break;
+                        }
                     }
-                    Ok(None) | Err(_) => {
-                        // Either next block is null (at chain head) or we got an error
-                        // (rate limit, network issue, etc). In any case, we can't verify
-                        // if the current block was skipped, so wait and retry.
-                        info!(height = next_height, "At chain head or cannot verify block, waiting");
-                        sleep(Duration::from_secs(2)).await;
-                    }
+                }
+
+                if !found_confirmation {
+                    // Couldn't find any block in lookahead range
+                    info!(height = next_height, "At chain head or cannot verify block, waiting");
+                    sleep(Duration::from_secs(2)).await;
                 }
             }
             Err(err) => {
@@ -229,5 +249,36 @@ mod tests {
         assert_eq!(prev_height, Some(100));
         assert!(prev_height.unwrap() >= current_height,
             "prev_height should equal current_height for sequential blocks");
+    }
+
+    /// Test consecutive skipped blocks (like 170866966 and 170866967)
+    /// Both blocks return null, but block 170866968 exists
+    #[test]
+    fn test_consecutive_skipped_blocks() {
+        // Blocks 170866966 and 170866967 both return null (skipped)
+        // Block 170866968 exists and points back to 170866965
+        let block_170866968 = json!({
+            "header": {
+                "height": 170866968,
+                "prev_height": 170866965  // Skips over 170866966 and 170866967!
+            }
+        });
+
+        // Test detecting first skipped block (170866966)
+        let current_height = 170866966;
+        let lookahead_block = &block_170866968;
+
+        let prev_height = lookahead_block
+            .pointer("/header/prev_height")
+            .and_then(|v| v.as_u64());
+
+        assert_eq!(prev_height, Some(170866965));
+        assert!(prev_height.unwrap() < current_height,
+            "prev_height should be less than current_height when blocks are skipped");
+
+        // Test detecting second skipped block (170866967)
+        let current_height = 170866967;
+        assert!(prev_height.unwrap() < current_height,
+            "prev_height should also be less than second skipped block height");
     }
 }
