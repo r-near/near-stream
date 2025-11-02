@@ -6,43 +6,32 @@
 //! - Publishing blocks to subscribers via broadcast channel
 
 use anyhow::Result;
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use redis::aio::ConnectionManager;
+use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
-
-use crate::types::BlockMsg;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct IngestConfig {
     pub neardata_base: String,
-    pub poll_retry_ms: u64,
 }
 
-/// Creates a configured HTTP client with automatic retries and exponential backoff
-fn create_http_client() -> ClientWithMiddleware {
-    let reqwest_client = reqwest::Client::builder()
+/// Creates a configured HTTP client with fast timeouts and no automatic retries
+fn create_http_client() -> Client {
+    Client::builder()
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(5))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
-        .expect("Failed to build HTTP client");
-
-    let retry_policy = ExponentialBackoff::builder()
-        .build_with_max_retries(5);
-
-    ClientBuilder::new(reqwest_client)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build()
+        .expect("Failed to build HTTP client")
 }
 
 /// Discovers the latest finalized block height from neardata.xyz.
 ///
 /// Uses the /v0/last_block/final endpoint which redirects to /v0/block/<height>
-async fn discover_latest_height(client: &ClientWithMiddleware, cfg: &IngestConfig) -> Result<u64> {
+async fn discover_latest_height(client: &Client, cfg: &IngestConfig) -> Result<u64> {
     let url = format!("{}/v0/last_block/final", cfg.neardata_base);
     let resp = client.get(&url).send().await?;
     let status = resp.status();
@@ -75,17 +64,16 @@ async fn discover_latest_height(client: &ClientWithMiddleware, cfg: &IngestConfi
 }
 
 /// Fetches a specific block by height, returns None if not yet available
-async fn fetch_block(client: &ClientWithMiddleware, cfg: &IngestConfig, height: u64) -> Result<Option<Value>> {
+async fn fetch_block(client: &Client, cfg: &IngestConfig, height: u64) -> Result<Option<Value>> {
     let url = format!("{}/v0/block/{}", cfg.neardata_base, height);
     let resp = client.get(&url).send().await?;
     let status = resp.status();
 
     if !status.is_success() {
         if status.as_u16() == 429 {
-            warn!(
-                height,
-                "Rate limited (429) - consider increasing POLL_RETRY_MS"
-            );
+            warn!(height, "Rate limited (429) - backing off for 1 second");
+            // Sleep here to backoff before returning
+            sleep(Duration::from_millis(1000)).await;
         } else {
             warn!(
                 height,
@@ -106,98 +94,85 @@ async fn fetch_block(client: &ClientWithMiddleware, cfg: &IngestConfig, height: 
     }
 }
 
-/// Main ingestion loop - polls for new blocks and broadcasts them
-pub async fn run_ingestor(cfg: IngestConfig, tx: broadcast::Sender<BlockMsg>) -> Result<()> {
+/// Main ingestion loop - optimistically polls for new blocks and publishes to Redis
+pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) -> Result<()> {
     info!("Starting block ingestor");
 
     let client = create_http_client();
     let mut next_height = discover_latest_height(&client, &cfg).await?;
 
+    info!(next_height, "Starting optimistic ingestion from block");
+
     loop {
-        // Check what's the latest finalized block
-        match discover_latest_height(&client, &cfg).await {
-            Ok(latest_finalized) => {
-                if next_height <= latest_finalized {
-                    // We have blocks to catch up on
-                    let blocks_behind = latest_finalized - next_height + 1;
-                    info!(
-                        next_height,
-                        latest_finalized,
-                        blocks_behind,
-                        "Catching up to latest finalized block"
-                    );
+        // Optimistically fetch next block without checking finality first
+        match fetch_block(&client, &cfg, next_height).await {
+            Ok(Some(block)) => {
+                // Publish to Redis Streams
+                if let Err(e) = crate::redis_stream::publish_block(&mut redis_conn, next_height, &block).await {
+                    warn!(height = next_height, error = ?e, "Failed to publish block to Redis, retrying");
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
 
-                    // Fetch all blocks from next_height to latest_finalized
-                    while next_height <= latest_finalized {
-                        match fetch_block(&client, &cfg, next_height).await {
-                            Ok(Some(block)) => {
-                                let msg = BlockMsg {
-                                    height: next_height,
-                                    block,
-                                };
+                info!(height = next_height, "Ingested and published block");
+                next_height += 1;
 
-                                // Broadcast to all subscribers (ignore if no receivers)
-                                let _ = tx.send(msg);
+                // Small delay to avoid rate limits
+                sleep(Duration::from_millis(150)).await;
+            }
+            Ok(None) => {
+                // Block returned null - could be skipped or not available yet
+                // Try to verify by checking next block, but only if we're not being rate limited
 
-                                info!(height = next_height, "Ingested and broadcast block");
-                                next_height += 1;
-                            }
-                            Ok(None) => {
-                                // Block returned null - could be skipped or not available yet
-                                // If we're behind finalized, verify by checking next block
-                                if next_height < latest_finalized {
-                                    match fetch_block(&client, &cfg, next_height + 1).await {
-                                        Ok(Some(next_block)) => {
-                                            // Check if next block's prev_height skips over current height
-                                            if let Some(prev_height) = next_block
-                                                .pointer("/header/prev_height")
-                                                .and_then(|v| v.as_u64())
-                                            {
-                                                if prev_height < next_height {
-                                                    // Confirmed: block was skipped by validator
-                                                    warn!(
-                                                        height = next_height,
-                                                        prev_height,
-                                                        latest_finalized,
-                                                        "Block confirmed skipped (validator missed it)"
-                                                    );
-                                                    next_height += 1;
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        Ok(None) | Err(_) => {
-                                            // Can't verify yet, will retry
-                                        }
-                                    }
-                                }
+                // Add a small delay before checking next block to avoid rapid-fire requests
+                sleep(Duration::from_millis(200)).await;
 
+                match fetch_block(&client, &cfg, next_height + 1).await {
+                    Ok(Some(next_block)) => {
+                        // Check if next block's prev_height skips over current height
+                        if let Some(prev_height) = next_block
+                            .pointer("/header/prev_height")
+                            .and_then(|v| v.as_u64())
+                        {
+                            if prev_height < next_height {
+                                // Confirmed: block was skipped by validator
                                 warn!(
                                     height = next_height,
-                                    latest_finalized,
-                                    "Block not available yet (unexpected - should be finalized)"
+                                    prev_height,
+                                    "Block skipped by validator"
                                 );
-                                break; // Exit inner loop, will re-check finality
-                            }
-                            Err(err) => {
-                                error!(
-                                    height = next_height,
-                                    error = ?err,
-                                    "Failed to fetch block"
-                                );
-                                break; // Exit inner loop, will retry after sleep
+                                next_height += 1;
+                                continue;
                             }
                         }
+                        // Next block exists but doesn't skip current block
+                        // Current block must not be available yet
+                        info!(height = next_height, "Block not available yet, waiting");
+                        sleep(Duration::from_secs(1)).await;
                     }
-                } else {
-                    // We're caught up, wait for new finalized blocks
-                    info!(next_height, "Caught up, waiting for new finalized blocks");
-                    sleep(Duration::from_millis(cfg.poll_retry_ms)).await;
+                    Ok(None) | Err(_) => {
+                        // Either next block is null (at chain head) or we got an error
+                        // (rate limit, network issue, etc). In any case, we can't verify
+                        // if the current block was skipped, so wait and retry.
+                        info!(height = next_height, "At chain head or cannot verify block, waiting");
+                        sleep(Duration::from_secs(2)).await;
+                    }
                 }
             }
             Err(err) => {
-                error!(error = ?err, "Failed to discover latest finalized height");
-                sleep(Duration::from_millis(cfg.poll_retry_ms)).await;
+                // Check if error indicates we're too far ahead
+                let err_str = err.to_string();
+                if err_str.contains("BLOCK_DOES_NOT_EXIST") || err_str.contains("too far in the future") {
+                    info!(height = next_height, "Ahead of finality, waiting");
+                    sleep(Duration::from_secs(1)).await;
+                } else {
+                    warn!(
+                        height = next_height,
+                        error = ?err,
+                        "Failed to fetch block, retrying"
+                    );
+                    sleep(Duration::from_millis(500)).await;
+                }
             }
         }
     }

@@ -4,23 +4,47 @@
 //! them to clients via SSE with automatic catch-up support.
 
 mod ingest;
+mod redis_stream;
 mod stream;
 mod types;
 
 use axum::{routing::get, Router};
 use std::env;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use ingest::{run_ingestor, IngestConfig};
 use stream::{health_handler, stream_handler, StreamState};
 
+/// Runtime mode for the application
+#[derive(Clone, Debug, PartialEq)]
+enum Mode {
+    /// Run only the ingester
+    Ingester,
+    /// Run only the SSE server
+    Server,
+}
+
+impl Mode {
+    fn from_env() -> Self {
+        match env::var("MODE").as_deref() {
+            Ok("ingester") => Self::Ingester,
+            Ok("server") => Self::Server,
+            _ => {
+                eprintln!("ERROR: MODE environment variable must be set to 'ingester' or 'server'");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// Application configuration loaded from environment variables
 #[derive(Clone)]
 struct Config {
+    mode: Mode,
     neardata_base: String,
-    ring_size: usize,
+    redis_url: String,
     poll_retry_ms: u64,
     bind_addr: String,
     bind_port: u16,
@@ -29,12 +53,10 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         Self {
+            mode: Mode::from_env(),
             neardata_base: env::var("NEARDATA_BASE")
                 .unwrap_or_else(|_| "https://mainnet.neardata.xyz".to_string()),
-            ring_size: env::var("RING_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(256),
+            redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             poll_retry_ms: env::var("POLL_RETRY_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -62,47 +84,40 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env();
 
     info!(
+        mode = ?config.mode,
         neardata_base = %config.neardata_base,
-        ring_size = config.ring_size,
+        redis_url = %config.redis_url,
         poll_retry_ms = config.poll_retry_ms,
-        "Starting NEAR Stream server"
+        "Starting NEAR Stream"
     );
 
-    // Create shared stream state
-    let stream_state = StreamState::new(config.ring_size);
+    // Setup Redis connection
+    let redis_conn = redis_stream::setup_redis(&config.redis_url).await?;
 
-    // Spawn ingestor task
-    {
-        let ingest_cfg = IngestConfig {
-            neardata_base: config.neardata_base.clone(),
-            poll_retry_ms: config.poll_retry_ms,
-        };
-        let tx = stream_state.broadcaster();
+    match config.mode {
+        Mode::Ingester => {
+            // Run only ingester
+            info!("Running in INGESTER mode");
 
-        tokio::spawn(async move {
-            if let Err(e) = run_ingestor(ingest_cfg, tx).await {
-                error!(error = ?e, "Ingestor task failed");
-            }
-        });
+            let ingest_cfg = IngestConfig {
+                neardata_base: config.neardata_base,
+            };
+
+            run_ingestor(ingest_cfg, redis_conn).await?;
+        }
+        Mode::Server => {
+            // Run only server
+            info!("Running in SERVER mode");
+            run_server(config, redis_conn).await?;
+        }
     }
 
-    // Spawn ring buffer updater task (subscribes to broadcasts and updates ring)
-    {
-        let state = stream_state.clone();
-        let mut rx = state.subscribe();
+    Ok(())
+}
 
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => state.push_block(msg),
-                    Err(e) => {
-                        error!(error = ?e, "Ring buffer updater error");
-                        break;
-                    }
-                }
-            }
-        });
-    }
+async fn run_server(config: Config, redis_conn: redis::aio::ConnectionManager) -> anyhow::Result<()> {
+    // Create stream state
+    let stream_state = StreamState::new(redis_conn);
 
     // Build router
     let app = Router::new()

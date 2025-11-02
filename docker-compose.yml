@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  # Redis - for block storage and streaming
+  redis:
+    image: redis:8-alpine
+    container_name: near-stream-redis
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # NEAR Ingester - fetches blocks and publishes to Redis
+  ingester:
+    build: .
+    container_name: near-stream-ingester
+    environment:
+      MODE: ingester
+      REDIS_URL: redis://redis:6379
+      NEARDATA_BASE: https://mainnet.neardata.xyz
+      POLL_RETRY_MS: 1000
+      RUST_LOG: info
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # NEAR SSE Server - streams blocks to clients via SSE
+  server:
+    build: .
+    container_name: near-stream-server
+    environment:
+      MODE: server
+      REDIS_URL: redis://redis:6379
+      BIND_ADDR: 0.0.0.0
+      BIND_PORT: 8080
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # To scale: docker compose up --scale server=3
+
+volumes:
+  redis-data:

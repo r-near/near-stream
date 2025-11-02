@@ -1,8 +1,7 @@
-//! SSE streaming and ring buffer management
+//! SSE streaming from Redis Streams
 //!
 //! This module handles:
-//! - Maintaining a ring buffer of recent blocks for catch-up
-//! - SSE stream creation with catch-up + live functionality
+//! - SSE stream creation with catch-up + live functionality from Redis
 //! - HTTP handler for /stream endpoint
 
 use axum::{
@@ -11,107 +10,120 @@ use axum::{
     response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Response},
     Json,
 };
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{Stream, StreamExt};
+use redis::aio::ConnectionManager;
 use serde::Deserialize;
-use std::{
-    collections::VecDeque,
-    convert::Infallible,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
-use tokio::sync::broadcast;
-use tracing::{info, warn};
-
-use crate::types::BlockMsg;
+use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
+use tracing::{error, info};
 
 /// Shared state for SSE streaming
 #[derive(Clone)]
 pub struct StreamState {
-    ring: Arc<RwLock<VecDeque<BlockMsg>>>,
-    tx: broadcast::Sender<BlockMsg>,
-    ring_size: usize,
+    redis_conn: Arc<Mutex<ConnectionManager>>,
 }
 
 impl StreamState {
-    pub fn new(ring_size: usize) -> Self {
-        let (tx, _rx) = broadcast::channel(1024);
+    pub fn new(redis_conn: ConnectionManager) -> Self {
         Self {
-            ring: Arc::new(RwLock::new(VecDeque::with_capacity(ring_size))),
-            tx,
-            ring_size,
+            redis_conn: Arc::new(Mutex::new(redis_conn)),
         }
     }
 
-    /// Get broadcast sender for ingestor to publish to
-    pub fn broadcaster(&self) -> broadcast::Sender<BlockMsg> {
-        self.tx.clone()
-    }
-
-    /// Add a block to the ring buffer (called by a background task)
-    pub fn push_block(&self, msg: BlockMsg) {
-        let mut ring = self.ring.write().unwrap();
-        if ring.len() == self.ring_size {
-            ring.pop_front();
-        }
-        ring.push_back(msg);
-    }
-
-    /// Subscribe to new blocks and receive them via broadcast channel
-    pub fn subscribe(&self) -> broadcast::Receiver<BlockMsg> {
-        self.tx.subscribe()
-    }
-
-    /// Get catchup blocks from ring buffer, filtering by resume_from height
-    fn get_catchup(&self, resume_from: Option<u64>) -> Vec<BlockMsg> {
-        let ring = self.ring.read().unwrap();
-        ring.iter()
-            .filter(|msg| resume_from.is_none_or(|height| msg.height > height))
-            .cloned()
-            .collect()
+    /// Get Redis connection for subscribing
+    pub fn redis_conn(&self) -> Arc<Mutex<ConnectionManager>> {
+        self.redis_conn.clone()
     }
 }
 
-/// Creates an SSE stream with catch-up from ring buffer + live updates
-fn create_sse_stream(
-    state: StreamState,
+/// Creates an SSE stream from Redis Streams
+async fn create_sse_stream(
+    redis_conn: Arc<Mutex<ConnectionManager>>,
     resume_from: Option<u64>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    // Step 1: Get catch-up blocks from ring buffer
-    let catchup_msgs = state.get_catchup(resume_from);
-    let catchup_stream = stream::iter(catchup_msgs.into_iter().map(|msg| {
-        let json = serde_json::to_string(&msg.block).unwrap_or_else(|_| "null".to_string());
+    // Get catchup blocks first
+    let catchup_blocks = {
+        let mut conn = redis_conn.lock().await;
+        match crate::redis_stream::get_catchup_blocks(&mut conn, resume_from).await {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                error!(error = ?e, "Failed to get catchup blocks from Redis");
+                Vec::new()
+            }
+        }
+    };
+
+    // Create catchup stream
+    let catchup_stream = futures::stream::iter(catchup_blocks.into_iter().map(|(height, block, _)| {
+        let block_json = serde_json::to_string(&block).unwrap_or_else(|_| "null".to_string());
         Ok::<_, Infallible>(
             Event::default()
                 .event("block")
-                .id(msg.height.to_string())
-                .data(json),
+                .id(height.to_string())
+                .data(block_json),
         )
     }));
 
-    // Step 2: Subscribe to live broadcast
-    let rx = state.subscribe();
-    let live_stream = stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Ok(msg) => {
-                let json =
-                    serde_json::to_string(&msg.block).unwrap_or_else(|_| "null".to_string());
-                let event = Event::default()
-                    .event("block")
-                    .id(msg.height.to_string())
-                    .data(json);
-                Some((Ok::<_, Infallible>(event), rx))
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(skipped, "Client lagged behind, sending resync event");
-                let event = Event::default().event("ping").data("resync");
-                Some((Ok::<_, Infallible>(event), rx))
-            }
-            Err(_) => None, // Channel closed
-        }
-    });
+    // Create live stream
+    let live_stream = futures::stream::unfold(
+        (redis_conn, None),
+        |(redis_conn, mut last_id): (Arc<Mutex<ConnectionManager>>, Option<String>)| async move {
+            loop {
+                let mut conn = redis_conn.lock().await;
 
-    // Chain catch-up and live streams
-    catchup_stream.chain(live_stream)
+                match crate::redis_stream::read_blocks(&mut conn, last_id.clone()).await {
+                    Ok(reply) => {
+                        drop(conn); // Release lock
+
+                        for stream_key in reply.keys {
+                            if let Some(entry) = stream_key.ids.into_iter().next() {
+                                // Parse height and block
+                                let height: u64 = entry.map.get("height")
+                                    .and_then(|v| match v {
+                                        redis::Value::BulkString(s) => String::from_utf8(s.clone()).ok(),
+                                        redis::Value::SimpleString(s) => Some(s.clone()),
+                                        _ => None,
+                                    })
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+
+                                let block_json = entry.map.get("block")
+                                    .and_then(|v| match v {
+                                        redis::Value::BulkString(s) => String::from_utf8(s.clone()).ok(),
+                                        redis::Value::SimpleString(s) => Some(s.clone()),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+
+                                last_id = Some(entry.id);
+
+                                let event = Ok::<_, Infallible>(
+                                    Event::default()
+                                        .event("block")
+                                        .id(height.to_string())
+                                        .data(block_json),
+                                );
+
+                                return Some((event, (redis_conn, last_id)));
+                            }
+                        }
+
+                        // No messages, continue loop
+                        continue;
+                    }
+                    Err(e) => {
+                        drop(conn); // Release lock
+                        error!(error = ?e, "Error reading from Redis");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                }
+            }
+        },
+    );
+
+    // Chain catchup and live streams
+    catchup_stream.chain(live_stream).boxed()
 }
 
 #[derive(Deserialize)]
@@ -169,7 +181,8 @@ pub async fn stream_handler(
     let resume_from = query.from_height;
     info!(?resume_from, "New SSE client connected");
 
-    let event_stream = create_sse_stream(state, resume_from);
+    let redis_conn = state.redis_conn();
+    let event_stream = create_sse_stream(redis_conn, resume_from).await;
 
     Sse::new(event_stream)
         .keep_alive(
