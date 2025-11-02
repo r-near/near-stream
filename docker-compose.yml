@@ -5,7 +5,7 @@ services:
     container_name: near-stream-redis
     command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
     ports:
-      - "6380:6379"
+      - "6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:

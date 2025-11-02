@@ -221,9 +221,33 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                 }
 
                 if !found_confirmation {
-                    // Couldn't find any block in lookahead range - likely at chain head
-                    info!(height = next_height, "At chain head, waiting");
-                    sleep(Duration::from_secs(2)).await;
+                    // Couldn't find any block in lookahead range
+                    // Refresh finalized height to check if block was actually skipped
+                    match discover_latest_height(&client, &cfg).await {
+                        Ok(height) => {
+                            latest_finalized = height;
+                            last_finality_check = tokio::time::Instant::now();
+
+                            if next_height + 10 < latest_finalized {
+                                // Block was definitely skipped - chain moved ahead
+                                warn!(
+                                    height = next_height,
+                                    latest_finalized,
+                                    "Block skipped (detected via finality check)"
+                                );
+                                next_height += 1;
+                                continue;
+                            } else {
+                                // Truly at chain head
+                                info!(height = next_height, latest_finalized, "At chain head, waiting");
+                                sleep(Duration::from_secs(2)).await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, "Failed to check finality, waiting");
+                            sleep(Duration::from_secs(2)).await;
+                        }
+                    }
                 }
             }
             Ok(BlockFetchResult::RateLimited) => {
