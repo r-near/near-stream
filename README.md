@@ -77,27 +77,34 @@ Health check endpoint. Returns `"ok"` as JSON.
 - **Real-time streaming** - SSE endpoint for live NEAR block data
 - **Automatic catch-up** - Clients can resume from any block height
 - **Finality guarantee** - Only streams finalized blocks
+- **Horizontally scalable** - Scale SSE servers independently with Redis
+- **Distributed architecture** - Separate ingester and server components
 - **Batch processing** - Efficiently handles multiple new blocks per poll
-- **Ring buffer** - In-memory cache of recent blocks for fast catch-up
-- **Exponential backoff** - Automatic retries with backoff on rate limits and errors
-- **Production-ready** - Built for reliability and self-hosting
+- **Redis-backed buffer** - 256 recent blocks cached for fast catch-up
+- **Production-ready** - Built for reliability, self-hosting, and Kubernetes
 
 ## Self-Hosting
 
-Want to run your own instance? Deploy with Docker or build from source.
+Want to run your own instance? Deploy with Docker Compose or build from source.
 
-### Docker
+### Docker Compose (Recommended)
+
+The service uses a distributed architecture with Redis for horizontal scaling:
 
 ```bash
-docker pull ghcr.io/r-near/near-stream:latest
+# Start all services (Redis + Ingester + Server)
+docker compose up -d
 
-docker run -d \
-  -p 8080:8080 \
-  -e RUST_LOG=info \
-  ghcr.io/r-near/near-stream:latest
+# Scale SSE servers for high traffic
+docker compose up -d --scale server=3
 ```
 
-Server starts on `http://localhost:8080`
+This starts:
+- **Redis** - Block storage and streaming (port 6380)
+- **Ingester** - Fetches blocks from neardata.xyz and publishes to Redis
+- **Server** - Serves SSE streams to clients (port 8080)
+
+Server available at `http://localhost:8080`
 
 ### Build from Source
 
@@ -105,13 +112,18 @@ Server starts on `http://localhost:8080`
 # Build
 cargo build --release
 
-# Run with defaults (mainnet)
-RUST_LOG=info cargo run --release
-
-# Run with custom config
+# Run ingester (fetches blocks, publishes to Redis)
+MODE=ingester \
+REDIS_URL=redis://localhost:6379 \
 NEARDATA_BASE=https://mainnet.neardata.xyz \
-RING_SIZE=512 \
 POLL_RETRY_MS=1000 \
+cargo run --release
+
+# Run server (serves SSE streams from Redis)
+MODE=server \
+REDIS_URL=redis://localhost:6379 \
+BIND_ADDR=0.0.0.0 \
+BIND_PORT=8080 \
 cargo run --release
 ```
 
@@ -119,14 +131,15 @@ cargo run --release
 
 All configuration via environment variables:
 
-| Variable        | Description                          | Default                            |
-| --------------- | ------------------------------------ | ---------------------------------- |
-| `NEARDATA_BASE` | neardata.xyz API base URL            | `https://mainnet.neardata.xyz`     |
-| `RING_SIZE`     | Number of recent blocks to cache     | `256`                              |
-| `POLL_RETRY_MS` | Milliseconds between finality checks | `1000`                             |
-| `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                          |
-| `BIND_PORT`     | Server bind port                     | `8080`                             |
-| `RUST_LOG`      | Log level (tracing filter)           | `near_stream=info,tower_http=info` |
+| Variable        | Description                          | Default                            | Used By         |
+| --------------- | ------------------------------------ | ---------------------------------- | --------------- |
+| `MODE`          | Runtime mode: `ingester` or `server` | **Required**                       | Both            |
+| `REDIS_URL`     | Redis connection URL                 | `redis://localhost:6379`           | Both            |
+| `NEARDATA_BASE` | neardata.xyz API base URL            | `https://mainnet.neardata.xyz`     | Ingester        |
+| `POLL_RETRY_MS` | Milliseconds between finality checks | `1000`                             | Ingester        |
+| `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                          | Server          |
+| `BIND_PORT`     | Server bind port                     | `8080`                             | Server          |
+| `RUST_LOG`      | Log level (tracing filter)           | `near_stream=info,tower_http=info` | Both            |
 
 ### Retry Behavior
 
@@ -142,18 +155,21 @@ The service automatically retries failed requests with exponential backoff:
 **For testnet:**
 
 ```bash
+# In docker-compose.yml, update ingester environment:
 NEARDATA_BASE=https://testnet.neardata.xyz
 ```
 
 **For high-traffic (many SSE clients):**
 
 ```bash
-RING_SIZE=1024  # More catch-up history
+# Scale SSE servers horizontally
+docker compose up -d --scale server=5
 ```
 
 **If consistently hitting rate limits:**
 
 ```bash
+# In docker-compose.yml, update ingester environment:
 POLL_RETRY_MS=2000  # Poll less frequently
 ```
 
@@ -165,57 +181,80 @@ RUST_LOG=near_stream=debug,tower_http=debug
 
 ## Architecture
 
+Distributed architecture with Redis for horizontal scaling:
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   NEAR Stream Service                   │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌──────────────┐         ┌─────────────────┐           │
-│  │   Ingestor   │───────▶│ Broadcast Chan   │           │
-│  │              │         │  (tokio::mpsc)  │           │
-│  │ - Polls      │         └────────┬────────┘           │
-│  │   /v0/last_  │                  │                    │
-│  │   block/final│                  │                    │
-│  │ - Fetches    │         ┌────────▼────────┐           │
-│  │   blocks     │         │  Ring Buffer    │           │
-│  │ - Batch      │         │   Updater       │           │
-│  │   catch-up   │         │                 │           │
-│  └──────────────┘         └─────────────────┘           │
-│                                                         │
-│                          ┌─────────────────┐            │
-│  ┌──────────────┐        │  Ring Buffer    │            │
-│  │ SSE Handler  │◀──────│  (VecDeque)      │           │
-│  │              │        │                 │            │
-│  │ - Catch-up   │        │  - 256 blocks   │            │
-│  │ - Live       │        │  - Fast resume  │            │
-│  │   stream     │        └─────────────────┘            │
-│  └──────────────┘                                       │
-│         │                                               │
-└─────────┼───────────────────────────────────────────────┘
-          │
-          ▼
-    SSE Clients
+┌──────────────────────────────────────────────────────────────────┐
+│                      NEAR Stream (Split)                         │
+└──────────────────────────────────────────────────────────────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │                                 │
+              ▼                                 ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │  Ingester (1x)  │              │  Server (Nx)    │
+    │                 │              │                 │
+    │ - Polls         │              │ - Catch-up      │
+    │   neardata.xyz  │              │   from Redis    │
+    │ - Fetches       │              │ - Subscribe to  │
+    │   blocks        │              │   new blocks    │
+    │ - Publishes to  │              │ - Serve SSE     │
+    │   Redis Streams │              │   to clients    │
+    └────────┬────────┘              └────────┬────────┘
+             │                                │
+             │      ┌──────────────┐          │
+             └─────▶│    Redis     │◀─────────┘
+                    │   Streams    │
+                    │              │
+                    │ - 256 blocks │
+                    │ - Auto-trim  │
+                    │ - Pub/sub    │
+                    └──────────────┘
+                           │
+                           ▼
+                    SSE Clients
 ```
+
+### Components
+
+1. **Ingester** (single instance)
+   - Polls neardata.xyz for finalized blocks
+   - Handles skipped blocks and rate limiting
+   - Publishes to Redis Streams
+   - Auto-trims to maintain 256 block buffer
+
+2. **Server** (horizontally scalable)
+   - Reads catch-up blocks from Redis
+   - Subscribes to new blocks via Redis Streams
+   - Serves SSE streams to clients
+   - Scale independently: `docker compose up --scale server=N`
+
+3. **Redis Streams**
+   - Persistent block buffer (256 blocks)
+   - Pub/sub for real-time distribution
+   - Automatic trimming (LRU eviction)
+   - Single source of truth
 
 ### Data Flow
 
-1. **Ingestor** polls neardata.xyz every 1s for latest finalized block
+1. **Ingester** polls neardata.xyz every ~1s for latest finalized block
 2. **Batch catch-up**: If multiple blocks finalized, fetches all sequentially
-3. **Broadcast**: Each block published to tokio broadcast channel
-4. **Ring buffer updater**: Subscribes to broadcast, maintains recent blocks
-5. **SSE handler**:
+3. **Publish**: Each block published to Redis Streams
+4. **Auto-trim**: Redis maintains last 256 blocks
+5. **SSE Servers**:
    - New client connects
-   - Serves catch-up blocks from ring buffer
-   - Subscribes to broadcast for live blocks
-   - Streams both via SSE
+   - Server reads catch-up blocks from Redis
+   - Server subscribes to Redis for new blocks
+   - Streams both via SSE to client
 
 ## Limitations
 
-- **No persistence**: Blocks only stored in-memory (ring buffer)
-  - Service restart = clients must reconnect from current finalized block
-  - Not an issue for live streaming use case
+- **Limited history**: Only 256 most recent blocks cached in Redis
+  - Older blocks require fetching from neardata.xyz directly
+  - Sufficient for reconnection and catch-up scenarios
 - **Single chain**: Configure for mainnet OR testnet, not both
-- **Rate limits**: Respects neardata.xyz API limits (1s poll interval)
+- **Rate limits**: Respects neardata.xyz API limits (~1s poll interval)
+- **Redis dependency**: Both ingester and servers require Redis connection
 
 ## Contributing
 
@@ -231,6 +270,7 @@ Built with:
 
 - [axum](https://github.com/tokio-rs/axum) - Web framework
 - [tokio](https://tokio.rs/) - Async runtime
+- [redis-rs](https://github.com/redis-rs/redis-rs) - Redis client with Streams support
 - [tracing](https://github.com/tokio-rs/tracing) - Structured logging
 - [reqwest-retry](https://github.com/TrueLayer/reqwest-middleware) - Automatic retry with exponential backoff
 - [neardata.xyz](https://neardata.xyz) - NEAR block data API
