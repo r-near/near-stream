@@ -55,7 +55,8 @@ impl Config {
             mode: Mode::from_env(),
             neardata_base: env::var("NEARDATA_BASE")
                 .unwrap_or_else(|_| "https://mainnet.neardata.xyz".to_string()),
-            redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+            redis_url: env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             poll_retry_ms: env::var("POLL_RETRY_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -114,7 +115,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_server(config: Config, redis_conn: redis::aio::ConnectionManager) -> anyhow::Result<()> {
+async fn run_server(
+    config: Config,
+    redis_conn: redis::aio::ConnectionManager,
+) -> anyhow::Result<()> {
     // Create stream state
     let stream_state = StreamState::new(redis_conn);
 

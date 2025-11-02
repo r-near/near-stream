@@ -116,7 +116,9 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
         match fetch_block(&client, &cfg, next_height).await {
             Ok(BlockFetchResult::Found(block)) => {
                 // Publish to Redis Streams
-                if let Err(e) = crate::redis_stream::publish_block(&mut redis_conn, next_height, &block).await {
+                if let Err(e) =
+                    crate::redis_stream::publish_block(&mut redis_conn, next_height, &block).await
+                {
                     warn!(height = next_height, error = ?e, "Failed to publish block to Redis, retrying");
                     sleep(Duration::from_millis(100)).await;
                     continue;
@@ -160,7 +162,10 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                                     Ordering::Equal => {
                                         // Next block points to current block, so current block exists
                                         // but just isn't available yet
-                                        info!(height = next_height, "Block not available yet, waiting");
+                                        info!(
+                                            height = next_height,
+                                            "Block not available yet, waiting"
+                                        );
                                         sleep(Duration::from_secs(1)).await;
                                         found_confirmation = true;
                                         break;
@@ -179,7 +184,10 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                         }
                         Ok(BlockFetchResult::RateLimited) => {
                             // Hit rate limit during lookahead - stop and back off
-                            warn!(height = next_height, "Rate limited during lookahead, backing off");
+                            warn!(
+                                height = next_height,
+                                "Rate limited during lookahead, backing off"
+                            );
                             found_confirmation = true;
                             sleep(Duration::from_secs(2)).await;
                             break;
@@ -200,14 +208,16 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                                 // Block was definitely skipped - chain moved ahead
                                 warn!(
                                     height = next_height,
-                                    latest_finalized,
-                                    "Block skipped (detected via finality check)"
+                                    latest_finalized, "Block skipped (detected via finality check)"
                                 );
                                 next_height += 1;
                                 continue;
                             } else {
                                 // Truly at chain head
-                                info!(height = next_height, latest_finalized, "At chain head, waiting");
+                                info!(
+                                    height = next_height,
+                                    latest_finalized, "At chain head, waiting"
+                                );
                                 sleep(Duration::from_secs(2)).await;
                             }
                         }
@@ -219,14 +229,19 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                 }
             }
             Ok(BlockFetchResult::RateLimited) => {
-                // Rate limited on the current block - back off significantly
-                warn!(height = next_height, "Rate limited (429), backing off for 3 seconds");
-                sleep(Duration::from_secs(3)).await;
+                // Rate limited on the current block - back off
+                warn!(
+                    height = next_height,
+                    "Rate limited (429), backing off for 1 second"
+                );
+                sleep(Duration::from_secs(1)).await;
             }
             Err(err) => {
                 // Check if error indicates we're too far ahead
                 let err_str = err.to_string();
-                if err_str.contains("BLOCK_DOES_NOT_EXIST") || err_str.contains("too far in the future") {
+                if err_str.contains("BLOCK_DOES_NOT_EXIST")
+                    || err_str.contains("too far in the future")
+                {
                     info!(height = next_height, "Ahead of finality, waiting");
                     sleep(Duration::from_secs(1)).await;
                 } else {
@@ -268,8 +283,10 @@ mod tests {
             .and_then(|v| v.as_u64());
 
         assert_eq!(prev_height, Some(170797834));
-        assert!(prev_height.unwrap() < current_height,
-            "prev_height should be less than current_height, confirming block was skipped");
+        assert!(
+            prev_height.unwrap() < current_height,
+            "prev_height should be less than current_height, confirming block was skipped"
+        );
     }
 
     /// Test that we don't incorrectly mark sequential blocks as skipped
@@ -291,8 +308,10 @@ mod tests {
             .and_then(|v| v.as_u64());
 
         assert_eq!(prev_height, Some(100));
-        assert!(prev_height.unwrap() >= current_height,
-            "prev_height should equal current_height for sequential blocks");
+        assert!(
+            prev_height.unwrap() >= current_height,
+            "prev_height should equal current_height for sequential blocks"
+        );
     }
 
     /// Test consecutive skipped blocks (like 170866966 and 170866967)
@@ -317,12 +336,16 @@ mod tests {
             .and_then(|v| v.as_u64());
 
         assert_eq!(prev_height, Some(170866965));
-        assert!(prev_height.unwrap() < current_height,
-            "prev_height should be less than current_height when blocks are skipped");
+        assert!(
+            prev_height.unwrap() < current_height,
+            "prev_height should be less than current_height when blocks are skipped"
+        );
 
         // Test detecting second skipped block (170866967)
         let current_height = 170866967;
-        assert!(prev_height.unwrap() < current_height,
-            "prev_height should also be less than second skipped block height");
+        assert!(
+            prev_height.unwrap() < current_height,
+            "prev_height should also be less than second skipped block height"
+        );
     }
 }

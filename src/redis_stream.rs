@@ -6,7 +6,11 @@
 //! - Subscribing to blocks from Redis Streams with automatic trimming
 
 use anyhow::Result;
-use redis::{aio::ConnectionManager, AsyncCommands, streams::{StreamReadOptions, StreamReadReply}};
+use redis::{
+    aio::ConnectionManager,
+    streams::{StreamReadOptions, StreamReadReply},
+    AsyncCommands,
+};
 use serde_json::Value;
 use tracing::info;
 
@@ -58,8 +62,7 @@ pub async fn read_blocks(
 ) -> Result<StreamReadReply> {
     let start_id = last_id.unwrap_or_else(|| "$".to_string());
 
-    let opts = StreamReadOptions::default()
-        .block(1000); // Block for 1 second waiting for new messages
+    let opts = StreamReadOptions::default().block(1000); // Block for 1 second waiting for new messages
 
     let results: StreamReadReply = conn
         .xread_options(&[STREAM_KEY], &[&start_id], &opts)
@@ -67,7 +70,6 @@ pub async fn read_blocks(
 
     Ok(results)
 }
-
 
 /// Get all blocks for catch-up (from beginning or from specific height)
 pub async fn get_catchup_blocks(
@@ -85,15 +87,15 @@ pub async fn get_catchup_blocks(
     let start_id = format!("{}-0", from_height + 1);
 
     // Read only blocks >= from_height using XRANGE with height-based IDs
-    let results: StreamRangeReply = conn
-        .xrange(STREAM_KEY, &start_id, "+")
-        .await?;
+    let results: StreamRangeReply = conn.xrange(STREAM_KEY, &start_id, "+").await?;
 
     let mut blocks = Vec::new();
 
     for stream_id in results.ids {
         // Parse height and block from the entry
-        let height: u64 = stream_id.map.get("height")
+        let height: u64 = stream_id
+            .map
+            .get("height")
             .and_then(|v| match v {
                 redis::Value::BulkString(s) => String::from_utf8(s.clone()).ok(),
                 redis::Value::SimpleString(s) => Some(s.clone()),
@@ -102,7 +104,9 @@ pub async fn get_catchup_blocks(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        let block_json = stream_id.map.get("block")
+        let block_json = stream_id
+            .map
+            .get("block")
             .and_then(|v| match v {
                 redis::Value::BulkString(s) => String::from_utf8(s.clone()).ok(),
                 redis::Value::SimpleString(s) => Some(s.clone()),

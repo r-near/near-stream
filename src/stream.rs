@@ -7,7 +7,10 @@
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap},
-    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     Json,
 };
 use futures::stream::{Stream, StreamExt};
@@ -54,15 +57,16 @@ async fn create_sse_stream(
     };
 
     // Create catchup stream
-    let catchup_stream = futures::stream::iter(catchup_blocks.into_iter().map(|(height, block, _)| {
-        let block_json = serde_json::to_string(&block).unwrap_or_else(|_| "null".to_string());
-        Ok::<_, Infallible>(
-            Event::default()
-                .event("block")
-                .id(height.to_string())
-                .data(block_json),
-        )
-    }));
+    let catchup_stream =
+        futures::stream::iter(catchup_blocks.into_iter().map(|(height, block, _)| {
+            let block_json = serde_json::to_string(&block).unwrap_or_else(|_| "null".to_string());
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event("block")
+                    .id(height.to_string())
+                    .data(block_json),
+            )
+        }));
 
     // Create live stream
     let live_stream = futures::stream::unfold(
@@ -78,18 +82,26 @@ async fn create_sse_stream(
                         for stream_key in reply.keys {
                             if let Some(entry) = stream_key.ids.into_iter().next() {
                                 // Parse height and block
-                                let height: u64 = entry.map.get("height")
+                                let height: u64 = entry
+                                    .map
+                                    .get("height")
                                     .and_then(|v| match v {
-                                        redis::Value::BulkString(s) => String::from_utf8(s.clone()).ok(),
+                                        redis::Value::BulkString(s) => {
+                                            String::from_utf8(s.clone()).ok()
+                                        }
                                         redis::Value::SimpleString(s) => Some(s.clone()),
                                         _ => None,
                                     })
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(0);
 
-                                let block_json = entry.map.get("block")
+                                let block_json = entry
+                                    .map
+                                    .get("block")
                                     .and_then(|v| match v {
-                                        redis::Value::BulkString(s) => String::from_utf8(s.clone()).ok(),
+                                        redis::Value::BulkString(s) => {
+                                            String::from_utf8(s.clone()).ok()
+                                        }
                                         redis::Value::SimpleString(s) => Some(s.clone()),
                                         _ => None,
                                     })
@@ -155,7 +167,11 @@ fn is_browser_request(headers: &HeaderMap) -> bool {
     // Fallback: Check User-Agent for common browsers
     if let Some(ua) = headers.get(header::USER_AGENT) {
         if let Ok(ua_str) = ua.to_str() {
-            if ua_str.contains("Mozilla") || ua_str.contains("Chrome") || ua_str.contains("Safari") || ua_str.contains("Edge") {
+            if ua_str.contains("Mozilla")
+                || ua_str.contains("Chrome")
+                || ua_str.contains("Safari")
+                || ua_str.contains("Edge")
+            {
                 // Only serve HTML if it's not curl (which also has Mozilla in some versions)
                 return !ua_str.starts_with("curl");
             }

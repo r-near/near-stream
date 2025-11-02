@@ -45,9 +45,7 @@ async fn test_skipped_block_via_lookahead() {
     let final_url = format!("{}/v0/block/100", mock_server.uri());
     Mock::given(method("GET"))
         .and(path("/v0/last_block/final"))
-        .respond_with(
-            ResponseTemplate::new(302).insert_header("Location", final_url.as_str()),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", final_url.as_str()))
         .mount(&mock_server)
         .await;
 
@@ -104,9 +102,8 @@ async fn test_skipped_block_via_lookahead() {
         neardata_base: mock_server.uri(),
     };
 
-    let ingest_handle = tokio::spawn(async move {
-        near_stream::ingest::run_ingestor(config, redis_conn).await
-    });
+    let ingest_handle =
+        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
 
     // Wait for ingestion to process blocks
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -123,8 +120,14 @@ async fn test_skipped_block_via_lookahead() {
         "Should have fetched block 102 via lookahead"
     );
 
-    println!("Block 101 fetch attempts: {}", block_101_calls.load(Ordering::SeqCst));
-    println!("Block 102 fetch attempts: {}", block_102_calls.load(Ordering::SeqCst));
+    println!(
+        "Block 101 fetch attempts: {}",
+        block_101_calls.load(Ordering::SeqCst)
+    );
+    println!(
+        "Block 102 fetch attempts: {}",
+        block_102_calls.load(Ordering::SeqCst)
+    );
 
     ingest_handle.abort();
 }
@@ -141,9 +144,7 @@ async fn test_rate_limit_causes_backoff() {
     let final_url = format!("{}/v0/block/200", mock_server.uri());
     Mock::given(method("GET"))
         .and(path("/v0/last_block/final"))
-        .respond_with(
-            ResponseTemplate::new(302).insert_header("Location", final_url.as_str()),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", final_url.as_str()))
         .mount(&mock_server)
         .await;
 
@@ -184,9 +185,8 @@ async fn test_rate_limit_causes_backoff() {
         neardata_base: mock_server.uri(),
     };
 
-    let ingest_handle = tokio::spawn(async move {
-        near_stream::ingest::run_ingestor(config, redis_conn).await
-    });
+    let ingest_handle =
+        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
 
     // Should eventually succeed after backoff
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -199,7 +199,10 @@ async fn test_rate_limit_causes_backoff() {
         attempts
     );
 
-    println!("Block 201 fetch attempts (including rate limits): {}", attempts);
+    println!(
+        "Block 201 fetch attempts (including rate limits): {}",
+        attempts
+    );
 
     ingest_handle.abort();
 }
@@ -272,9 +275,8 @@ async fn test_api_lag_eventually_succeeds() {
         neardata_base: mock_server.uri(),
     };
 
-    let ingest_handle = tokio::spawn(async move {
-        near_stream::ingest::run_ingestor(config, redis_conn).await
-    });
+    let ingest_handle =
+        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
 
     // Wait for block to eventually be available (longer timeout for test concurrency)
     tokio::time::sleep(Duration::from_secs(15)).await;
@@ -378,19 +380,19 @@ async fn test_immediate_finality_check_on_unavailable_block() {
         neardata_base: mock_server.uri(),
     };
 
-    let ingest_handle = tokio::spawn(async move {
-        near_stream::ingest::run_ingestor(config, redis_conn).await
-    });
+    let ingest_handle =
+        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
 
     // Wait for immediate finality check to happen (should be quick with the fix)
     let mut checks_snapshot = 0;
     let detection_start = std::time::Instant::now();
 
-    for _ in 0..30 {  // Check every 100ms for up to 3 seconds
+    for _ in 0..30 {
+        // Check every 100ms for up to 3 seconds
         tokio::time::sleep(Duration::from_millis(100)).await;
         checks_snapshot = finality_check_count.load(Ordering::SeqCst);
         if checks_snapshot >= 2 {
-            break;  // Detected!
+            break; // Detected!
         }
     }
 
@@ -432,9 +434,7 @@ async fn test_consecutive_skipped_blocks() {
     let final_url = format!("{}/v0/block/400", mock_server.uri());
     Mock::given(method("GET"))
         .and(path("/v0/last_block/final"))
-        .respond_with(
-            ResponseTemplate::new(302).insert_header("Location", final_url.as_str()),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", final_url.as_str()))
         .mount(&mock_server)
         .await;
 
@@ -490,9 +490,8 @@ async fn test_consecutive_skipped_blocks() {
         neardata_base: mock_server.uri(),
     };
 
-    let ingest_handle = tokio::spawn(async move {
-        near_stream::ingest::run_ingestor(config, redis_conn).await
-    });
+    let ingest_handle =
+        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -503,7 +502,10 @@ async fn test_consecutive_skipped_blocks() {
     );
 
     println!("Successfully detected consecutive skipped blocks 401 and 402");
-    println!("Block 403 fetch attempts: {}", block_403_calls.load(Ordering::SeqCst));
+    println!(
+        "Block 403 fetch attempts: {}",
+        block_403_calls.load(Ordering::SeqCst)
+    );
 
     ingest_handle.abort();
 }
