@@ -29,11 +29,13 @@ pub async fn publish_block(
 ) -> Result<String> {
     let block_json = serde_json::to_string(block)?;
 
-    // Add to stream with auto-generated ID
+    // Use height as entry ID for efficient range queries
+    let entry_id = format!("{}-0", height);
+
     let id: String = conn
         .xadd(
             STREAM_KEY,
-            "*",
+            entry_id,
             &[("height", height.to_string()), ("block", block_json)],
         )
         .await?;
@@ -74,9 +76,17 @@ pub async fn get_catchup_blocks(
 ) -> Result<Vec<(u64, Value, String)>> {
     use redis::streams::StreamRangeReply;
 
-    // Read all messages from the stream using XRANGE
+    // If no from_height specified, return empty - client will start from live stream
+    let Some(from_height) = from_height else {
+        return Ok(Vec::new());
+    };
+
+    // Start from next block after from_height
+    let start_id = format!("{}-0", from_height + 1);
+
+    // Read only blocks >= from_height using XRANGE with height-based IDs
     let results: StreamRangeReply = conn
-        .xrange(STREAM_KEY, "-", "+")
+        .xrange(STREAM_KEY, &start_id, "+")
         .await?;
 
     let mut blocks = Vec::new();
@@ -100,11 +110,8 @@ pub async fn get_catchup_blocks(
             })
             .unwrap_or_default();
 
-        // Filter by height if specified
-        if from_height.is_none_or(|h| height > h) {
-            if let Ok(block) = serde_json::from_str(&block_json) {
-                blocks.push((height, block, stream_id.id.clone()));
-            }
+        if let Ok(block) = serde_json::from_str(&block_json) {
+            blocks.push((height, block, stream_id.id.clone()));
         }
     }
 
