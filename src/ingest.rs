@@ -9,6 +9,7 @@ use anyhow::Result;
 use redis::aio::ConnectionManager;
 use reqwest::Client;
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -16,6 +17,16 @@ use tracing::{info, warn};
 #[derive(Clone)]
 pub struct IngestConfig {
     pub neardata_base: String,
+}
+
+/// Result of attempting to fetch a block
+enum BlockFetchResult {
+    /// Block was successfully fetched
+    Found(Value),
+    /// Block returned null (not available yet or skipped)
+    NotAvailable,
+    /// Rate limited by API (429)
+    RateLimited,
 }
 
 /// Creates a configured HTTP client with fast timeouts and no automatic retries
@@ -63,34 +74,31 @@ async fn discover_latest_height(client: &Client, cfg: &IngestConfig) -> Result<u
     Ok(height)
 }
 
-/// Fetches a specific block by height, returns None if not yet available
-async fn fetch_block(client: &Client, cfg: &IngestConfig, height: u64) -> Result<Option<Value>> {
+/// Fetches a specific block by height
+async fn fetch_block(client: &Client, cfg: &IngestConfig, height: u64) -> Result<BlockFetchResult> {
     let url = format!("{}/v0/block/{}", cfg.neardata_base, height);
     let resp = client.get(&url).send().await?;
     let status = resp.status();
 
     if !status.is_success() {
         if status.as_u16() == 429 {
-            warn!(height, "Rate limited (429) - backing off for 1 second");
-            // Sleep here to backoff before returning
-            sleep(Duration::from_millis(1000)).await;
+            return Ok(BlockFetchResult::RateLimited);
         } else {
             warn!(
                 height,
                 status_code = status.as_u16(),
                 "Non-success status when fetching block"
             );
+            return Ok(BlockFetchResult::NotAvailable);
         }
-        return Ok(None);
     }
 
     let json: Value = resp.json().await?;
-    // neardata.xyz returns null for blocks that don't exist yet
+    // neardata.xyz returns null for blocks that don't exist yet or if skipped
     if json.is_null() {
-        warn!(height, "Block returned null (not available yet)");
-        Ok(None)
+        Ok(BlockFetchResult::NotAvailable)
     } else {
-        Ok(Some(json))
+        Ok(BlockFetchResult::Found(json))
     }
 }
 
@@ -100,13 +108,29 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
 
     let client = create_http_client();
     let mut next_height = discover_latest_height(&client, &cfg).await?;
+    let mut latest_finalized = next_height;
+    let mut last_finality_check = tokio::time::Instant::now();
 
     info!(next_height, "Starting optimistic ingestion from block");
 
     loop {
-        // Optimistically fetch next block without checking finality first
+        // Periodically refresh latest finalized height (every 30 seconds)
+        if last_finality_check.elapsed() > Duration::from_secs(30) {
+            match discover_latest_height(&client, &cfg).await {
+                Ok(height) => {
+                    latest_finalized = height;
+                    last_finality_check = tokio::time::Instant::now();
+                    info!(latest_finalized, next_height, "Refreshed latest finalized height");
+                }
+                Err(e) => {
+                    warn!(error = ?e, "Failed to refresh latest finalized height, continuing");
+                }
+            }
+        }
+
+        // Optimistically fetch next block
         match fetch_block(&client, &cfg, next_height).await {
-            Ok(Some(block)) => {
+            Ok(BlockFetchResult::Found(block)) => {
                 // Publish to Redis Streams
                 if let Err(e) = crate::redis_stream::publish_block(&mut redis_conn, next_height, &block).await {
                     warn!(height = next_height, error = ?e, "Failed to publish block to Redis, retrying");
@@ -120,51 +144,74 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                 // Small delay to avoid rate limits
                 sleep(Duration::from_millis(150)).await;
             }
-            Ok(None) => {
+            Ok(BlockFetchResult::NotAvailable) => {
                 // Block returned null - could be skipped or not available yet
-                // Try to verify by checking next blocks (look ahead up to 5 blocks)
-                // to handle consecutive skipped blocks
+                // Use latest finalized height to determine if definitely skipped
 
+                if next_height + 10 < latest_finalized {
+                    // We're far behind finalized - this block is definitely skipped
+                    warn!(
+                        height = next_height,
+                        latest_finalized,
+                        "Block skipped (well below finalized height)"
+                    );
+                    next_height += 1;
+                    continue;
+                }
+
+                // We're near the chain head - use lookahead to verify
                 sleep(Duration::from_millis(200)).await;
 
                 let mut found_confirmation = false;
 
-                // Look ahead up to 5 blocks to detect consecutive skipped blocks
-                for lookahead in 1..=5 {
+                // Look ahead up to 2 blocks to detect skipped blocks
+                for lookahead in 1..=2 {
                     match fetch_block(&client, &cfg, next_height + lookahead).await {
-                        Ok(Some(block)) => {
+                        Ok(BlockFetchResult::Found(block)) => {
                             // Found a block - check its prev_height
                             if let Some(prev_height) = block
                                 .pointer("/header/prev_height")
                                 .and_then(|v| v.as_u64())
                             {
-                                if prev_height < next_height {
-                                    // Confirmed: current block was skipped
-                                    warn!(
-                                        height = next_height,
-                                        prev_height,
-                                        lookahead_height = next_height + lookahead,
-                                        "Block skipped by validator (detected via lookahead)"
-                                    );
-                                    next_height += 1;
-                                    found_confirmation = true;
-                                    break;
-                                } else if prev_height == next_height {
-                                    // Next block points to current block, so current block exists
-                                    // but just isn't available yet
-                                    info!(height = next_height, "Block not available yet, waiting");
-                                    sleep(Duration::from_secs(1)).await;
-                                    found_confirmation = true;
-                                    break;
+                                match prev_height.cmp(&next_height) {
+                                    Ordering::Less => {
+                                        // Confirmed: current block was skipped
+                                        warn!(
+                                            height = next_height,
+                                            prev_height,
+                                            lookahead_height = next_height + lookahead,
+                                            "Block skipped by validator (detected via lookahead)"
+                                        );
+                                        next_height += 1;
+                                        found_confirmation = true;
+                                        break;
+                                    }
+                                    Ordering::Equal => {
+                                        // Next block points to current block, so current block exists
+                                        // but just isn't available yet
+                                        info!(height = next_height, "Block not available yet, waiting");
+                                        sleep(Duration::from_secs(1)).await;
+                                        found_confirmation = true;
+                                        break;
+                                    }
+                                    Ordering::Greater => {
+                                        // prev_height > next_height means there might be multiple skips
+                                        // Continue looking ahead
+                                    }
                                 }
-                                // prev_height > next_height means there might be multiple skips
-                                // Continue looking ahead
                             }
                         }
-                        Ok(None) => {
+                        Ok(BlockFetchResult::NotAvailable) => {
                             // This lookahead block is also null, try next lookahead
                             sleep(Duration::from_millis(100)).await;
                             continue;
+                        }
+                        Ok(BlockFetchResult::RateLimited) => {
+                            // Hit rate limit during lookahead - stop and back off
+                            warn!(height = next_height, "Rate limited during lookahead, backing off");
+                            found_confirmation = true;
+                            sleep(Duration::from_secs(2)).await;
+                            break;
                         }
                         Err(_) => {
                             // Error fetching lookahead block, stop trying
@@ -174,10 +221,15 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
                 }
 
                 if !found_confirmation {
-                    // Couldn't find any block in lookahead range
-                    info!(height = next_height, "At chain head or cannot verify block, waiting");
+                    // Couldn't find any block in lookahead range - likely at chain head
+                    info!(height = next_height, "At chain head, waiting");
                     sleep(Duration::from_secs(2)).await;
                 }
+            }
+            Ok(BlockFetchResult::RateLimited) => {
+                // Rate limited on the current block - back off significantly
+                warn!(height = next_height, "Rate limited (429), backing off for 3 seconds");
+                sleep(Duration::from_secs(3)).await;
             }
             Err(err) => {
                 // Check if error indicates we're too far ahead

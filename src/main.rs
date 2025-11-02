@@ -6,7 +6,6 @@
 mod ingest;
 mod redis_stream;
 mod stream;
-mod types;
 
 use axum::{routing::get, Router};
 use std::env;
