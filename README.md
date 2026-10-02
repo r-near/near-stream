@@ -175,9 +175,11 @@ ingester per Redis stream. Missing block responses (null or HTTP 404) use the sa
 lookahead and finality checks to advance skipped heights.
 Set `START_FROM_LATEST=true` to skip the backlog and discover the finalized head
 at every ingester startup, including restarts. Existing Redis entries remain
-cached, but the next published height intentionally jumps forward to that head;
-intervening blocks are not ingested. Leave it unset or `false` to resume the
-stored cursor. Values other than lowercase `true` or `false` are rejected.
+cached, but ingestion starts at the greater of that head and the cached height
+plus one. This intentionally skips intervening backlog when the head is ahead,
+and avoids republishing an already cached head on a rapid restart. Leave it unset
+or `false` to resume the stored cursor. Values other than lowercase `true` or
+`false` are rejected.
 Non-null block responses must contain the requested `/block/header/height`;
 malformed or mismatched responses are retried without advancing the cursor.
 

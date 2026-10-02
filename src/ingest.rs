@@ -258,31 +258,36 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
     );
     anyhow::ensure!(!cfg.poll_retry.is_zero(), "poll_retry must be positive");
     let mut client = NearDataClient::new(cfg.request_interval);
-    let stored_height = if cfg.start_from_latest {
-        info!("Starting from the provider's finalized head");
-        None
-    } else {
-        crate::redis_stream::last_published_height(&mut redis_conn).await?
-    };
-    let mut next_height = match stored_height {
-        Some(height) => {
-            info!(height, "Resuming after the last block stored in Redis");
+    let stored_height = crate::redis_stream::last_published_height(&mut redis_conn).await?;
+    let resume_height = stored_height
+        .map(|height| height.checked_add(1).context("Redis block height overflow"))
+        .transpose()?;
+    let mut next_height = match resume_height {
+        Some(height) if !cfg.start_from_latest => {
+            info!(
+                height = height - 1,
+                "Resuming after the last block stored in Redis"
+            );
             height
-                .checked_add(1)
-                .context("Redis block height overflow")?
         }
-        None => loop {
-            match discover_latest_height(&mut client, &cfg).await {
-                Ok(height) => break height,
-                Err(err) => {
-                    if is_permanent_http_error(&err) {
-                        return Err(err);
-                    }
-                    warn!(error = ?err, "Failed to discover NearData head, retrying");
-                    sleep(cfg.poll_retry).await;
-                }
+        resume_height => {
+            if cfg.start_from_latest {
+                info!("Starting from the provider's finalized head");
             }
-        },
+            let latest_height = loop {
+                match discover_latest_height(&mut client, &cfg).await {
+                    Ok(height) => break height,
+                    Err(err) => {
+                        if is_permanent_http_error(&err) {
+                            return Err(err);
+                        }
+                        warn!(error = ?err, "Failed to discover NearData head, retrying");
+                        sleep(cfg.poll_retry).await;
+                    }
+                }
+            };
+            latest_height.max(resume_height.unwrap_or(latest_height))
+        }
     };
 
     info!(next_height, "Starting optimistic ingestion from block");
