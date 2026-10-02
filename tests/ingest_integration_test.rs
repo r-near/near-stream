@@ -101,6 +101,121 @@ async fn test_start_from_latest_preserves_cache_and_skips_persisted_cursor() {
     }));
 }
 
+/// Equal or lagging finalized heads must continue after the durable cursor.
+#[tokio::test]
+async fn test_latest_head_never_republishes_or_moves_behind_cached_cursor() {
+    for cached_height in [200, 205] {
+        let next_height = cached_height + 1;
+        let server = MockServer::start().await;
+        Mock::given(path("/v0/last_block/final"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/v0/block/200"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/v0/block/{next_height}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_block(next_height, cached_height)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/v0/block/{}", next_height + 1)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::Value::Null)
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+        let client = redis::Client::open(
+            std::env::var("TEST_REDIS_URL")
+                .expect("Set TEST_REDIS_URL to a disposable Redis database"),
+        )
+        .unwrap();
+        let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        near_stream::redis_stream::publish_block(
+            &mut conn,
+            cached_height,
+            &mock_block(cached_height, cached_height - 1),
+        )
+        .await
+        .unwrap();
+        let config = near_stream::ingest::IngestConfig {
+            neardata_base: server.uri(),
+            request_interval: Duration::from_millis(1),
+            poll_retry: Duration::from_millis(100),
+            start_from_latest: true,
+        };
+        let handle = tokio::spawn(near_stream::ingest::run_ingestor(config, conn.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while near_stream::redis_stream::last_published_height(&mut conn)
+                .await
+                .unwrap()
+                != Some(next_height)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        let blocks =
+            near_stream::redis_stream::get_catchup_blocks(&mut conn, Some(cached_height - 1))
+                .await
+                .unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|(height, _, _)| *height)
+                .collect::<Vec<_>>(),
+            vec![cached_height, next_height]
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path() != "/v0/block/200"));
+    }
+}
+
+#[tokio::test]
+async fn test_latest_head_fails_closed_on_cursor_overflow() {
+    let server = MockServer::start().await;
+    let client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    near_stream::redis_stream::publish_block(
+        &mut conn,
+        u64::MAX,
+        &mock_block(u64::MAX, u64::MAX - 1),
+    )
+    .await
+    .unwrap();
+    let config = near_stream::ingest::IngestConfig {
+        neardata_base: server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
+        start_from_latest: true,
+    };
+    let error = near_stream::ingest::run_ingestor(config, conn)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Redis block height overflow"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 /// Restart against a different endpoint while its head is ahead of our cursor.
 /// Catch-up must preserve every available block and still advance a skipped 404.
 #[tokio::test]
