@@ -10,7 +10,7 @@
 //! `cargo test --test ingest_integration_test -- --test-threads=1`
 
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::matchers::{method, path};
@@ -19,13 +19,245 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Helper to create a mock block with specified height and prev_height
 fn mock_block(height: u64, prev_height: u64) -> serde_json::Value {
     json!({
-        "header": {
+        "block": { "header": {
             "height": height,
             "prev_height": prev_height,
             "timestamp": 1234567890,
         },
-        "chunks": []
+        "chunks": [] },
+        "shards": []
     })
+}
+
+/// Restart against a different endpoint while its head is ahead of our cursor.
+/// Catch-up must preserve every available block and still advance a skipped 404.
+#[tokio::test]
+async fn test_restart_resumes_persisted_cursor_across_endpoint_change() {
+    let first = MockServer::start().await;
+    Mock::given(path("/v0/last_block/final"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/v0/block/100"))
+        .expect(1)
+        .mount(&first)
+        .await;
+    Mock::given(path("/v0/block/100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(100, 99)))
+        .expect(1)
+        .mount(&first)
+        .await;
+
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
+    let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut redis_conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        near_stream::redis_stream::last_published_height(&mut redis_conn)
+            .await
+            .unwrap(),
+        None
+    );
+    let config = near_stream::ingest::IngestConfig {
+        neardata_base: first.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
+    };
+    let handle = tokio::spawn(near_stream::ingest::run_ingestor(
+        config,
+        redis_conn.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while near_stream::redis_stream::last_published_height(&mut redis_conn)
+            .await
+            .unwrap()
+            != Some(100)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+
+    let second = MockServer::start().await;
+    Mock::given(path("/v0/last_block/final"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/v0/block/200"))
+        .expect(0)
+        .mount(&second)
+        .await;
+    Mock::given(path("/v0/block/101"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&second)
+        .await;
+    for (height, prev_height) in [(102, 100), (103, 102)] {
+        Mock::given(path(format!("/v0/block/{height}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(height, prev_height)))
+            .mount(&second)
+            .await;
+    }
+    let config = near_stream::ingest::IngestConfig {
+        neardata_base: second.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
+    };
+    let handle = tokio::spawn(near_stream::ingest::run_ingestor(
+        config,
+        redis_conn.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while near_stream::redis_stream::last_published_height(&mut redis_conn)
+            .await
+            .unwrap()
+            != Some(103)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+
+    let blocks = near_stream::redis_stream::get_catchup_blocks(&mut redis_conn, Some(99))
+        .await
+        .unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|(height, _, _)| *height)
+            .collect::<Vec<_>>(),
+        vec![100, 102, 103]
+    );
+    assert!(second
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.url.path() != "/v0/block/200"));
+}
+
+/// A malformed durable cursor must fail instead of silently starting at the tip.
+#[tokio::test]
+async fn test_invalid_persisted_cursor_does_not_jump_to_head() {
+    let server = MockServer::start().await;
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    redis::cmd("XADD")
+        .arg("blocks")
+        .arg("100-1")
+        .arg("height")
+        .arg(100)
+        .arg("block")
+        .arg("{}")
+        .query_async::<String>(&mut conn)
+        .await
+        .unwrap();
+    let config = near_stream::ingest::IngestConfig {
+        neardata_base: server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
+    };
+    let error = near_stream::ingest::run_ingestor(config, conn)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not a height-based ID"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// A successful HTTP response with another height must never enter the stream.
+#[tokio::test]
+async fn test_wrong_response_height_does_not_advance_persisted_cursor() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let allow_valid_response = Arc::new(AtomicBool::new(false));
+    let response_gate = allow_valid_response.clone();
+    Mock::given(path("/v0/block/101"))
+        .respond_with(move |_: &wiremock::Request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let height = if response_gate.load(Ordering::SeqCst) {
+                101
+            } else {
+                999
+            };
+            ResponseTemplate::new(200).set_body_json(mock_block(height, 100))
+        })
+        .mount(&server)
+        .await;
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    near_stream::redis_stream::publish_block(&mut conn, 100, &mock_block(100, 99))
+        .await
+        .unwrap();
+    let config = near_stream::ingest::IngestConfig {
+        neardata_base: server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(250),
+    };
+    let handle = tokio::spawn(near_stream::ingest::run_ingestor(config, conn.clone()));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        near_stream::redis_stream::last_published_height(&mut conn)
+            .await
+            .unwrap(),
+        Some(100)
+    );
+    allow_valid_response.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while near_stream::redis_stream::last_published_height(&mut conn)
+            .await
+            .unwrap()
+            != Some(101)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+    let blocks = near_stream::redis_stream::get_catchup_blocks(&mut conn, Some(100))
+        .await
+        .unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].0, 101);
+    assert_eq!(
+        blocks[0].1.pointer("/block/header/height"),
+        Some(&json!(101))
+    );
 }
 
 /// Test that skipped blocks are detected via lookahead
@@ -86,7 +318,10 @@ async fn test_skipped_block_via_lookahead() {
         .await;
 
     // Setup Redis and flush all data
-    let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
         .await
         .unwrap();
@@ -100,10 +335,13 @@ async fn test_skipped_block_via_lookahead() {
     // Run ingester in background
     let config = near_stream::ingest::IngestConfig {
         neardata_base: mock_server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
     };
 
+    let ingestor_conn = redis_conn.clone();
     let ingest_handle =
-        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
+        tokio::spawn(async move { near_stream::ingest::run_ingestor(config, ingestor_conn).await });
 
     // Wait for ingestion to process blocks
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -120,6 +358,12 @@ async fn test_skipped_block_via_lookahead() {
         "Should have fetched block 102 via lookahead"
     );
 
+    let published = near_stream::redis_stream::get_catchup_blocks(&mut redis_conn, Some(100))
+        .await
+        .unwrap();
+    assert!(published.iter().any(|(height, _, _)| *height == 102));
+    assert!(!published.iter().any(|(height, _, _)| *height == 101));
+
     println!(
         "Block 101 fetch attempts: {}",
         block_101_calls.load(Ordering::SeqCst)
@@ -132,7 +376,7 @@ async fn test_skipped_block_via_lookahead() {
     ingest_handle.abort();
 }
 
-/// Test that rate limiting causes proper backoff
+/// Test that rate limiting pauses requests rather than retrying every second
 #[tokio::test]
 async fn test_rate_limit_causes_backoff() {
     let mock_server = MockServer::start().await;
@@ -155,14 +399,14 @@ async fn test_rate_limit_causes_backoff() {
         .mount(&mock_server)
         .await;
 
-    // Block 201 - rate limited first 2 times, then available
+    // Block 201 - rate limited first 2 times, then available after cooldown
     let counter = rate_limit_count.clone();
     Mock::given(method("GET"))
         .and(path("/v0/block/201"))
         .respond_with(move |_: &wiremock::Request| {
             let count = counter.fetch_add(1, Ordering::SeqCst);
             if count < 2 {
-                ResponseTemplate::new(429) // Rate limited
+                ResponseTemplate::new(429).insert_header("Retry-After", "1") // Rate limited
             } else {
                 ResponseTemplate::new(200).set_body_json(mock_block(201, 200))
             }
@@ -170,7 +414,10 @@ async fn test_rate_limit_causes_backoff() {
         .mount(&mock_server)
         .await;
 
-    let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
         .await
         .unwrap();
@@ -183,19 +430,21 @@ async fn test_rate_limit_causes_backoff() {
 
     let config = near_stream::ingest::IngestConfig {
         neardata_base: mock_server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
     };
 
     let ingest_handle =
         tokio::spawn(async move { near_stream::ingest::run_ingestor(config, redis_conn).await });
 
-    // Should eventually succeed after backoff
+    // The shared cooldown must suppress repeated requests during this interval.
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Verify we hit rate limit at least twice before succeeding
+    // Verify only the initial rate-limited attempt reached NearData.
     let attempts = rate_limit_count.load(Ordering::SeqCst);
     assert!(
-        attempts >= 3,
-        "Should have retried after rate limits (attempts: {})",
+        attempts == 1,
+        "Should wait for the shared 60s cooldown (attempts: {})",
         attempts
     );
 
@@ -260,7 +509,10 @@ async fn test_api_lag_eventually_succeeds() {
             .await;
     }
 
-    let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
         .await
         .unwrap();
@@ -273,6 +525,8 @@ async fn test_api_lag_eventually_succeeds() {
 
     let config = near_stream::ingest::IngestConfig {
         neardata_base: mock_server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
     };
 
     let ingest_handle =
@@ -365,7 +619,10 @@ async fn test_immediate_finality_check_on_unavailable_block() {
             .await;
     }
 
-    let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
         .await
         .unwrap();
@@ -378,6 +635,8 @@ async fn test_immediate_finality_check_on_unavailable_block() {
 
     let config = near_stream::ingest::IngestConfig {
         neardata_base: mock_server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
     };
 
     let ingest_handle =
@@ -412,7 +671,7 @@ async fn test_immediate_finality_check_on_unavailable_block() {
         checks_snapshot
     );
 
-    // With the fix, detection should happen within 2 seconds
+    // With the explicit fast test budget, detection should happen within 2 seconds
     // Without the fix, would wait 30+ seconds for periodic finality check
     assert!(
         detection_time < Duration::from_secs(2),
@@ -475,7 +734,10 @@ async fn test_consecutive_skipped_blocks() {
         .mount(&mock_server)
         .await;
 
-    let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
     let mut redis_conn = redis::aio::ConnectionManager::new(redis_client)
         .await
         .unwrap();
@@ -488,6 +750,8 @@ async fn test_consecutive_skipped_blocks() {
 
     let config = near_stream::ingest::IngestConfig {
         neardata_base: mock_server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
     };
 
     let ingest_handle =

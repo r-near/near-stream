@@ -23,6 +23,7 @@ services:
       REDIS_URL: redis://redis:6379
       NEARDATA_BASE: https://mainnet.neardata.xyz
       POLL_RETRY_MS: 1000
+      NEARDATA_REQUESTS_PER_MINUTE: ${NEARDATA_REQUESTS_PER_MINUTE:-15}
       RUST_LOG: info
     depends_on:
       redis:

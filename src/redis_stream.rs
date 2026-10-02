@@ -5,7 +5,7 @@
 //! - Publishing blocks to Redis Streams
 //! - Subscribing to blocks from Redis Streams with automatic trimming
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use redis::{
     aio::ConnectionManager,
     streams::{StreamReadOptions, StreamReadReply},
@@ -23,6 +23,33 @@ pub async fn setup_redis(redis_url: &str) -> Result<ConnectionManager> {
     let client = redis::Client::open(redis_url)?;
     let conn = ConnectionManager::new(client).await?;
     Ok(conn)
+}
+
+/// Read the durable cursor from the newest block successfully stored in Redis.
+/// Empty streams have no cursor and start from the provider's finalized head.
+pub async fn last_published_height(conn: &mut ConnectionManager) -> Result<Option<u64>> {
+    use redis::streams::StreamRangeReply;
+
+    let entries: StreamRangeReply = redis::cmd("XREVRANGE")
+        .arg(STREAM_KEY)
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(1)
+        .query_async(conn)
+        .await?;
+    entries
+        .ids
+        .first()
+        .map(|entry| {
+            entry
+                .id
+                .strip_suffix("-0")
+                .context("Redis block stream ID is not a height-based ID")?
+                .parse()
+                .context("Redis block stream ID has an invalid height")
+        })
+        .transpose()
 }
 
 /// Publish a block to Redis Streams
