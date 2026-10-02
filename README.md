@@ -136,19 +136,50 @@ All configuration via environment variables:
 | `MODE`          | Runtime mode: `ingester` or `server` | **Required**                       | Both            |
 | `REDIS_URL`     | Redis connection URL                 | `redis://localhost:6379`           | Both            |
 | `NEARDATA_BASE` | neardata.xyz API base URL            | `https://mainnet.neardata.xyz`     | Ingester        |
-| `POLL_RETRY_MS` | Milliseconds between finality checks | `1000`                             | Ingester        |
+| `POLL_RETRY_MS` | Delay after unavailable data or errors | `1000`                             | Ingester        |
+| `NEARDATA_REQUESTS_PER_MINUTE` | Shared maximum request rate | `15` | Ingester |
 | `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                          | Server          |
 | `BIND_PORT`     | Server bind port                     | `8080`                             | Server          |
 | `RUST_LOG`      | Log level (tracing filter)           | `near_stream=info,tower_http=info` | Both            |
 
 ### Retry Behavior
 
-The service automatically retries failed requests with exponential backoff:
+All NearData requests share a pacing budget, including discovery, lookahead,
+redirects, and retries. The default `NEARDATA_REQUESTS_PER_MINUTE=15` spaces
+request starts by 4.1 seconds (4 seconds plus a 100ms margin). Catch-up uses the
+same budget. `POLL_RETRY_MS` adds a delay after unavailable data or errors; it
+does not cap the request rate by itself.
 
-- **Max retries**: 5 attempts
-- **Backoff**: Exponentially increases (1s, 2s, 4s, 8s, 16s)
-- **Triggers**: 429 (rate limit), 5xx (server errors), network failures
-- **Jitter**: Prevents thundering herd on retry
+HTTP 429 pauses the entire NearData client for at least 60 seconds. Longer
+`Retry-After` values are respected, including HTTP dates. Consecutive 429s
+increase the fallback cooldown to 120, 240, then 480 seconds. A zero or missing
+`Retry-After` never causes an immediate retry. Each 429 also doubles request
+spacing, up to 60 seconds (or the initial spacing if already longer). After at
+least 60 consecutive successful requests spanning at least 60 seconds, spacing
+recovers by one halving step, never faster than the
+configured ceiling. Failures restart this recovery window. Success resets the
+cooldown escalation.
+Startup discovery also retries transient failures. Network failures, rate limits,
+and server errors are never treated as missing blocks. Permanent client errors
+such as 401/403 fail instead of looping indefinitely.
+
+The head is read from the `/v0/last_block/final` redirect without following it,
+which avoids downloading the first block twice.
+
+On restart, ingestion resumes after the newest height already stored in the Redis
+`blocks` stream. An empty stream starts at the provider's finalized head. Changing
+`NEARDATA_BASE` therefore preserves the stored cursor and catches up sequentially
+through an endpoint with the same network and NearData response format. Keep one
+ingester per Redis stream. Missing block responses (null or HTTP 404) use the same
+lookahead and finality checks to advance skipped heights.
+Non-null block responses must contain the requested `/block/header/height`;
+malformed or mismatched responses are retried without advancing the cursor.
+
+**Capacity:** an unauthenticated 30 requests/minute budget cannot keep a complete
+stream live when the chain produces more than 30 blocks/minute. Ingestion
+preserves sequential blocks and will fall behind in that case. A higher provider
+allowance is necessary for a complete live stream. Do not raise the configured
+rate above the allowance for your IP; other indexers on the same IP share it.
 
 ### Tuning Recommendations
 
@@ -170,7 +201,7 @@ docker compose up -d --scale server=5
 
 ```bash
 # In docker-compose.yml, update ingester environment:
-POLL_RETRY_MS=2000  # Poll less frequently
+NEARDATA_REQUESTS_PER_MINUTE=10  # Leave room for other requests on the same IP
 ```
 
 **For verbose debugging:**
@@ -237,7 +268,7 @@ Distributed architecture with Redis for horizontal scaling:
 
 ### Data Flow
 
-1. **Ingester** polls neardata.xyz every ~1s for latest finalized block
+1. **Ingester** resumes its Redis cursor (or discovers the finalized head for an empty stream) and fetches successive heights within its request budget
 2. **Batch catch-up**: If multiple blocks finalized, fetches all sequentially
 3. **Publish**: Each block published to Redis Streams
 4. **Auto-trim**: Redis maintains last 256 blocks
@@ -253,7 +284,7 @@ Distributed architecture with Redis for horizontal scaling:
   - Older blocks require fetching from neardata.xyz directly
   - Sufficient for reconnection and catch-up scenarios
 - **Single chain**: Configure for mainnet OR testnet, not both
-- **Rate limits**: Respects neardata.xyz API limits (~1s poll interval)
+- **Rate limits**: Shared request pacing and global 429 cooldown; lower budgets can accumulate lag
 - **Redis dependency**: Both ingester and servers require Redis connection
 
 ## Contributing
@@ -272,5 +303,17 @@ Built with:
 - [tokio](https://tokio.rs/) - Async runtime
 - [redis-rs](https://github.com/redis-rs/redis-rs) - Redis client with Streams support
 - [tracing](https://github.com/tokio-rs/tracing) - Structured logging
-- [reqwest-retry](https://github.com/TrueLayer/reqwest-middleware) - Automatic retry with exponential backoff
+- [reqwest](https://github.com/seanmonstar/reqwest) - HTTP transport with shared request pacing
 - [neardata.xyz](https://neardata.xyz) - NEAR block data API
+
+## Local validation
+
+Use a disposable Redis database; the integration suite clears it:
+
+```bash
+docker run -d --rm --name near-stream-test-redis -p 127.0.0.1:16379:6379 redis:8-alpine
+TEST_REDIS_URL=redis://127.0.0.1:16379 cargo test -- --test-threads=1
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+docker stop near-stream-test-redis
+```

@@ -8,7 +8,7 @@ mod redis_stream;
 mod stream;
 
 use axum::{routing::get, Router};
-use std::env;
+use std::{env, time::Duration};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -45,6 +45,7 @@ struct Config {
     neardata_base: String,
     redis_url: String,
     poll_retry_ms: u64,
+    requests_per_minute: u64,
     bind_addr: String,
     bind_port: u16,
 }
@@ -57,16 +58,25 @@ impl Config {
                 .unwrap_or_else(|_| "https://mainnet.neardata.xyz".to_string()),
             redis_url: env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
-            poll_retry_ms: env::var("POLL_RETRY_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000),
+            poll_retry_ms: positive_env("POLL_RETRY_MS", 1000),
+            requests_per_minute: positive_env("NEARDATA_REQUESTS_PER_MINUTE", 15),
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string()),
             bind_port: env::var("BIND_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080),
         }
+    }
+}
+
+fn positive_env(name: &str, default: u64) -> u64 {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| panic!("{name} must be a positive integer")),
+        Err(_) => default,
     }
 }
 
@@ -88,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         neardata_base = %config.neardata_base,
         redis_url = %config.redis_url,
         poll_retry_ms = config.poll_retry_ms,
+        requests_per_minute = config.requests_per_minute,
         "Starting NEAR Stream"
     );
 
@@ -101,6 +112,10 @@ async fn main() -> anyhow::Result<()> {
 
             let ingest_cfg = IngestConfig {
                 neardata_base: config.neardata_base,
+                request_interval: Duration::from_millis(
+                    60_000_u64.div_ceil(config.requests_per_minute) + 100,
+                ),
+                poll_retry: Duration::from_millis(config.poll_retry_ms),
             };
 
             run_ingestor(ingest_cfg, redis_conn).await?;
