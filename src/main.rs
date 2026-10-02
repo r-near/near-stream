@@ -46,6 +46,7 @@ struct Config {
     redis_url: String,
     poll_retry_ms: u64,
     requests_per_minute: u64,
+    start_from_latest: bool,
     bind_addr: String,
     bind_port: u16,
 }
@@ -60,6 +61,7 @@ impl Config {
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             poll_retry_ms: positive_env("POLL_RETRY_MS", 1000),
             requests_per_minute: positive_env("NEARDATA_REQUESTS_PER_MINUTE", 15),
+            start_from_latest: boolean_env("START_FROM_LATEST", false),
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string()),
             bind_port: env::var("BIND_PORT")
                 .ok()
@@ -77,6 +79,16 @@ fn positive_env(name: &str, default: u64) -> u64 {
             .filter(|n| *n > 0)
             .unwrap_or_else(|| panic!("{name} must be a positive integer")),
         Err(_) => default,
+    }
+}
+
+fn boolean_env(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be true or false")),
+        Err(env::VarError::NotPresent) => default,
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be true or false"),
     }
 }
 
@@ -99,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         redis_url = %config.redis_url,
         poll_retry_ms = config.poll_retry_ms,
         requests_per_minute = config.requests_per_minute,
+        start_from_latest = config.start_from_latest,
         "Starting NEAR Stream"
     );
 
@@ -116,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
                     60_000_u64.div_ceil(config.requests_per_minute) + 100,
                 ),
                 poll_retry: Duration::from_millis(config.poll_retry_ms),
+                start_from_latest: config.start_from_latest,
             };
 
             run_ingestor(ingest_cfg, redis_conn).await?;

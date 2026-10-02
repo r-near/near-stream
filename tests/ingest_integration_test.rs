@@ -29,6 +29,78 @@ fn mock_block(height: u64, prev_height: u64) -> serde_json::Value {
     })
 }
 
+/// Explicit latest-head startup skips backlog while preserving cached entries.
+#[tokio::test]
+async fn test_start_from_latest_preserves_cache_and_skips_persisted_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v0/last_block/final"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/v0/block/200"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/v0/block/200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_block(200, 199)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/v0/block/201"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::Value::Null)
+                .set_delay(Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+    let redis_client = redis::Client::open(
+        std::env::var("TEST_REDIS_URL").expect("Set TEST_REDIS_URL to a disposable Redis database"),
+    )
+    .unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap();
+    redis::cmd("FLUSHDB")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    near_stream::redis_stream::publish_block(&mut conn, 100, &mock_block(100, 99))
+        .await
+        .unwrap();
+    let config = near_stream::ingest::IngestConfig {
+        neardata_base: server.uri(),
+        request_interval: Duration::from_millis(1),
+        poll_retry: Duration::from_millis(100),
+        start_from_latest: true,
+    };
+    let handle = tokio::spawn(near_stream::ingest::run_ingestor(config, conn.clone()));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while near_stream::redis_stream::last_published_height(&mut conn)
+            .await
+            .unwrap()
+            != Some(200)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+    let blocks = near_stream::redis_stream::get_catchup_blocks(&mut conn, Some(99))
+        .await
+        .unwrap();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|(height, _, _)| *height)
+            .collect::<Vec<_>>(),
+        vec![100, 200]
+    );
+    assert!(server.received_requests().await.unwrap().iter().all(|r| {
+        !r.url.path().starts_with("/v0/block/")
+            || matches!(r.url.path(), "/v0/block/200" | "/v0/block/201")
+    }));
+}
+
 /// Restart against a different endpoint while its head is ahead of our cursor.
 /// Catch-up must preserve every available block and still advance a skipped 404.
 #[tokio::test]
@@ -66,6 +138,7 @@ async fn test_restart_resumes_persisted_cursor_across_endpoint_change() {
         neardata_base: first.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
     let handle = tokio::spawn(near_stream::ingest::run_ingestor(
         config,
@@ -106,6 +179,7 @@ async fn test_restart_resumes_persisted_cursor_across_endpoint_change() {
         neardata_base: second.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
     let handle = tokio::spawn(near_stream::ingest::run_ingestor(
         config,
@@ -172,6 +246,7 @@ async fn test_invalid_persisted_cursor_does_not_jump_to_head() {
         neardata_base: server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
     let error = near_stream::ingest::run_ingestor(config, conn)
         .await
@@ -218,6 +293,7 @@ async fn test_wrong_response_height_does_not_advance_persisted_cursor() {
         neardata_base: server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(250),
+        start_from_latest: false,
     };
     let handle = tokio::spawn(near_stream::ingest::run_ingestor(config, conn.clone()));
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -337,6 +413,7 @@ async fn test_skipped_block_via_lookahead() {
         neardata_base: mock_server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
 
     let ingestor_conn = redis_conn.clone();
@@ -432,6 +509,7 @@ async fn test_rate_limit_causes_backoff() {
         neardata_base: mock_server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
 
     let ingest_handle =
@@ -527,6 +605,7 @@ async fn test_api_lag_eventually_succeeds() {
         neardata_base: mock_server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
 
     let ingest_handle =
@@ -637,6 +716,7 @@ async fn test_immediate_finality_check_on_unavailable_block() {
         neardata_base: mock_server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
 
     let ingest_handle =
@@ -752,6 +832,7 @@ async fn test_consecutive_skipped_blocks() {
         neardata_base: mock_server.uri(),
         request_interval: Duration::from_millis(1),
         poll_retry: Duration::from_millis(100),
+        start_from_latest: false,
     };
 
     let ingest_handle =
