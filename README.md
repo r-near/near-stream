@@ -138,6 +138,7 @@ All configuration via environment variables:
 | `NEARDATA_BASE` | neardata.xyz API base URL            | `https://mainnet.neardata.xyz`     | Ingester        |
 | `POLL_RETRY_MS` | Delay after unavailable data or errors | `1000`                             | Ingester        |
 | `NEARDATA_REQUESTS_PER_MINUTE` | Shared maximum request rate | `15` | Ingester |
+| `START_FROM_LATEST` | Start at the finalized head instead of resuming Redis (`true` or `false`) | `false` | Ingester |
 | `BIND_ADDR`     | Server bind address                  | `0.0.0.0`                          | Server          |
 | `BIND_PORT`     | Server bind port                     | `8080`                             | Server          |
 | `RUST_LOG`      | Log level (tracing filter)           | `near_stream=info,tower_http=info` | Both            |
@@ -172,6 +173,11 @@ On restart, ingestion resumes after the newest height already stored in the Redi
 through an endpoint with the same network and NearData response format. Keep one
 ingester per Redis stream. Missing block responses (null or HTTP 404) use the same
 lookahead and finality checks to advance skipped heights.
+Set `START_FROM_LATEST=true` to skip the backlog and discover the finalized head
+at every ingester startup, including restarts. Existing Redis entries remain
+cached, but the next published height intentionally jumps forward to that head;
+intervening blocks are not ingested. Leave it unset or `false` to resume the
+stored cursor. Values other than lowercase `true` or `false` are rejected.
 Non-null block responses must contain the requested `/block/header/height`;
 malformed or mismatched responses are retried without advancing the cursor.
 
@@ -268,7 +274,7 @@ Distributed architecture with Redis for horizontal scaling:
 
 ### Data Flow
 
-1. **Ingester** resumes its Redis cursor (or discovers the finalized head for an empty stream) and fetches successive heights within its request budget
+1. **Ingester** resumes its Redis cursor (or discovers the finalized head for an empty stream or `START_FROM_LATEST=true`) and fetches successive heights within its request budget
 2. **Batch catch-up**: If multiple blocks finalized, fetches all sequentially
 3. **Publish**: Each block published to Redis Streams
 4. **Auto-trim**: Redis maintains last 256 blocks

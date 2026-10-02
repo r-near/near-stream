@@ -21,6 +21,8 @@ pub struct IngestConfig {
     pub request_interval: Duration,
     /// Delay before polling again after unavailable data or an error.
     pub poll_retry: Duration,
+    /// Discover the finalized head at every startup instead of resuming Redis.
+    pub start_from_latest: bool,
 }
 
 /// Result of attempting to fetch a block
@@ -256,7 +258,13 @@ pub async fn run_ingestor(cfg: IngestConfig, mut redis_conn: ConnectionManager) 
     );
     anyhow::ensure!(!cfg.poll_retry.is_zero(), "poll_retry must be positive");
     let mut client = NearDataClient::new(cfg.request_interval);
-    let mut next_height = match crate::redis_stream::last_published_height(&mut redis_conn).await? {
+    let stored_height = if cfg.start_from_latest {
+        info!("Starting from the provider's finalized head");
+        None
+    } else {
+        crate::redis_stream::last_published_height(&mut redis_conn).await?
+    };
+    let mut next_height = match stored_height {
         Some(height) => {
             info!(height, "Resuming after the last block stored in Redis");
             height
@@ -452,6 +460,7 @@ mod tests {
             neardata_base: base,
             request_interval: Duration::from_millis(100),
             poll_retry: Duration::from_millis(10),
+            start_from_latest: false,
         }
     }
 
